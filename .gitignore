@@ -1,0 +1,32 @@
+# C++ build artifacts
+fairness_benchmark
+*.o
+*.exe
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Test files (large)
+test_file_*
+
+# Results and logs
+fairness_results/
+*.log
+*.csv
+*.iostat
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+
+# Backup files
+*~
+*.bak
+*.orig
