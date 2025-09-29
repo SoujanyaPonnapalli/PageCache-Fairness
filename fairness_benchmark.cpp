@@ -181,16 +181,43 @@ private:
             return true;
         }
 
+        // Enable controllers in parent cgroup first
+        // This is required for cgroup v2
+        std::string enable_controllers = "echo '+cpu +memory +io' | sudo tee /sys/fs/cgroup/cgroup.subtree_control > /dev/null 2>&1";
+        system(enable_controllers.c_str());
+
         // Apply cgroup settings
+        int success_count = 0;
+        int fail_count = 0;
+
         for (const auto& [key, value] : cgroup.settings) {
             std::string setting_file = cgroup_path + "/" + key;
+
+            // Check if the controller file exists first
+            std::string check_cmd = "test -f " + setting_file;
+            if (system(check_cmd.c_str()) != 0) {
+                // File doesn't exist, controller might not be enabled
+                continue;
+            }
+
             std::string set_cmd = "echo '" + value + "' | sudo tee " + setting_file + " > /dev/null 2>&1";
-            if (system(set_cmd.c_str()) != 0) {
-                log("WARNING: Failed to set " + key + " for cgroup " + cgroup.cgroup_name);
+            if (system(set_cmd.c_str()) == 0) {
+                success_count++;
+            } else {
+                fail_count++;
+                if (verbose) {
+                    log("WARNING: Failed to set " + key + " for cgroup " + cgroup.cgroup_name);
+                }
             }
         }
 
-        log("Setup cgroup: " + cgroup.cgroup_name + " for " + client_name);
+        if (success_count > 0) {
+            log("Setup cgroup: " + cgroup.cgroup_name + " (" + std::to_string(success_count) +
+                " settings applied, " + std::to_string(fail_count) + " failed)");
+        } else {
+            log("WARNING: No cgroup settings applied for " + cgroup.cgroup_name + " (controllers may not be available)");
+        }
+
         return true;
     }
 
