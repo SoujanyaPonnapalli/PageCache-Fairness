@@ -1,0 +1,427 @@
+#include <iostream>
+#include <string>
+#include <vector>
+#include <map>
+#include <fstream>
+#include <filesystem>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
+#include <cstdlib>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <cstring>
+
+namespace fs = std::filesystem;
+
+struct WorkloadConfig {
+    std::string description;
+    std::string file_size;
+    std::string block_size;
+    int runtime;
+    int numjobs;
+    int iodepth;
+    std::string pattern;
+};
+
+class FairnessBenchmark {
+private:
+    std::string config_file;
+    std::string output_dir;
+    bool verbose;
+    std::map<std::string, WorkloadConfig> workloads;
+
+    std::string get_timestamp() {
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::stringstream ss;
+        ss << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S");
+        return ss.str();
+    }
+
+    void log(const std::string& message) {
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::cout << "[" << std::put_time(std::localtime(&time_t), "%H:%M:%S")
+                  << "] " << message << std::endl;
+    }
+
+    bool check_dependencies() {
+        if (system("which fio > /dev/null 2>&1") != 0) {
+            log("ERROR: fio is required but not installed");
+            return false;
+        }
+
+        if (!fs::exists(config_file)) {
+            log("ERROR: Config file not found: " + config_file);
+            return false;
+        }
+
+        return true;
+    }
+
+    void setup() {
+        log("Setting up fairness benchmark...");
+
+        if (fs::exists(output_dir)) {
+            fs::remove_all(output_dir);
+        }
+        fs::create_directories(output_dir);
+        fs::create_directories(output_dir + "/iostat");
+
+        // Create metadata
+        std::ofstream metadata(output_dir + "/metadata.txt");
+        metadata << "timestamp=" << get_timestamp() << std::endl;
+        metadata << "config_file=" << config_file << std::endl;
+        metadata << "test_type=fairness_benchmark" << std::endl;
+        metadata.close();
+    }
+
+    void drop_caches() {
+        system("sync");
+        system("sudo purge 2>/dev/null || true");
+        sleep(1);
+    }
+
+    uintmax_t get_size_bytes(const std::string& size_str) {
+        if (size_str == "1G") return 1ULL * 1024 * 1024 * 1024;
+        if (size_str == "16G") return 16ULL * 1024 * 1024 * 1024;
+        return 0;
+    }
+
+    void create_test_file(const std::string& file_size, const std::string& test_file) {
+        if (fs::exists(test_file)) {
+            auto actual_size = fs::file_size(test_file);
+            auto expected_size = get_size_bytes(file_size);
+
+            if (actual_size >= expected_size) {
+                log("Using existing " + file_size + " test file: " + test_file);
+                return;
+            }
+        }
+
+        log("Creating " + file_size + " test file: " + test_file);
+        std::string cmd;
+        if (file_size == "1G") {
+            cmd = "dd if=/dev/zero of=" + test_file + " bs=1M count=1024 2>/dev/null";
+        } else if (file_size == "16G") {
+            cmd = "dd if=/dev/zero of=" + test_file + " bs=1M count=16384 2>/dev/null";
+        } else {
+            log("ERROR: Unsupported file size: " + file_size);
+            exit(1);
+        }
+        system(cmd.c_str());
+        log("Test file created: " + test_file);
+    }
+
+    bool run_workload(const std::string& workload_name) {
+        auto it = workloads.find(workload_name);
+        if (it == workloads.end()) {
+            log("ERROR: Workload '" + workload_name + "' not found in config");
+            return false;
+        }
+
+        const auto& config = it->second;
+        log("Running workload: " + workload_name);
+
+        if (verbose) {
+            log("  Config: " + config.file_size + ", " + config.block_size +
+                ", jobs=" + std::to_string(config.numjobs) +
+                ", depth=" + std::to_string(config.iodepth) +
+                ", pattern=" + config.pattern);
+        }
+
+        // Create test file
+        std::string script_dir = fs::current_path().string();
+        std::string test_file = script_dir + "/test_file_" + config.file_size;
+        create_test_file(config.file_size, test_file);
+
+        // Test both cached and direct modes
+        std::vector<std::string> cache_modes = {"cached", "direct"};
+        for (const auto& cache_mode : cache_modes) {
+            std::string test_name = workload_name + "_" + cache_mode;
+            std::string output_file = output_dir + "/" + test_name + ".json";
+            std::string iostat_file = output_dir + "/iostat/" + test_name + ".iostat";
+
+            log("  Running: " + test_name);
+
+            // Start iostat monitoring
+            pid_t iostat_pid = fork();
+            if (iostat_pid == 0) {
+                freopen(iostat_file.c_str(), "w", stdout);
+                freopen("/dev/null", "w", stderr);
+                execl("/usr/bin/iostat", "iostat", "-d", "-w", "1", nullptr);
+                exit(1);
+            }
+
+            drop_caches();
+
+            // Build fio command
+            std::ostringstream fio_cmd;
+            fio_cmd << "fio"
+                    << " --name=" << test_name
+                    << " --filename=" << test_file
+                    << " --size=" << config.file_size
+                    << " --runtime=" << config.runtime
+                    << " --time_based=1"
+                    << " --rw=" << config.pattern
+                    << " --bs=" << config.block_size
+                    << " --numjobs=" << config.numjobs
+                    << " --iodepth=" << config.iodepth
+                    << " --group_reporting=1"
+                    << " --output-format=json"
+                    << " --output=" << output_file;
+
+            if (cache_mode == "direct") {
+                fio_cmd << " --direct=1";
+            }
+
+            // Run test
+            if (verbose) {
+                log("  Executing: " + fio_cmd.str());
+                system(fio_cmd.str().c_str());
+            } else {
+                std::string silent_cmd = fio_cmd.str() + " >/dev/null 2>&1";
+                system(silent_cmd.c_str());
+            }
+
+            // Check result and log
+            if (fs::exists(output_file)) {
+                log("  ✓ Completed: " + test_name);
+            } else {
+                log("  ✗ Failed: " + test_name);
+            }
+
+            // Stop iostat
+            if (iostat_pid > 0) {
+                kill(iostat_pid, SIGTERM);
+                waitpid(iostat_pid, nullptr, 0);
+            }
+            sleep(1);
+        }
+
+        return true;
+    }
+
+    void run_all_workloads() {
+        log("Running all " + std::to_string(workloads.size()) + " fairness workloads...");
+
+        int completed = 0;
+        for (const auto& [name, config] : workloads) {
+            run_workload(name);
+            completed++;
+            log("Progress: " + std::to_string(completed) + "/" + std::to_string(workloads.size()) + " workloads completed");
+        }
+    }
+
+    void generate_summary() {
+        int json_files = 0;
+        int iostat_files = 0;
+
+        for (const auto& entry : fs::directory_iterator(output_dir)) {
+            if (entry.path().extension() == ".json" &&
+                entry.path().filename() != "metadata.txt") {
+                json_files++;
+            }
+        }
+
+        for (const auto& entry : fs::directory_iterator(output_dir + "/iostat")) {
+            if (entry.path().extension() == ".iostat") {
+                iostat_files++;
+            }
+        }
+
+        log("Generated " + std::to_string(json_files) + " fio results and " +
+            std::to_string(iostat_files) + " iostat logs");
+
+        std::ofstream summary(output_dir + "/summary.txt");
+        summary << "Fairness Benchmark Results Summary\n"
+                << "=================================\n"
+                << "Timestamp: " << get_timestamp() << "\n"
+                << "Config File: " << config_file << "\n"
+                << "\n"
+                << "Results:\n"
+                << "- FIO JSON results: " << json_files << " files\n"
+                << "- iostat monitoring: " << iostat_files << " files\n"
+                << "\n"
+                << "To analyze results:\n"
+                << "    ./quick_fairness_analysis.py " << output_dir << "\n"
+                << std::endl;
+        summary.close();
+
+        log("Summary saved to " + output_dir + "/summary.txt");
+    }
+
+    bool parse_config_file() {
+        std::ifstream file(config_file);
+        if (!file.is_open()) {
+            log("ERROR: Cannot open config file: " + config_file);
+            return false;
+        }
+
+        std::string line, current_section;
+        WorkloadConfig current_workload;
+
+        while (std::getline(file, line)) {
+            // Skip empty lines and comments
+            if (line.empty() || line[0] == '#' || line[0] == ';') {
+                continue;
+            }
+
+            // Section header [workload_name]
+            if (line[0] == '[' && line.back() == ']') {
+                if (!current_section.empty()) {
+                    workloads[current_section] = current_workload;
+                }
+                current_section = line.substr(1, line.length() - 2);
+                current_workload = WorkloadConfig(); // Reset
+                continue;
+            }
+
+            // Key=value pairs
+            size_t eq_pos = line.find('=');
+            if (eq_pos != std::string::npos) {
+                std::string key = line.substr(0, eq_pos);
+                std::string value = line.substr(eq_pos + 1);
+
+                // Trim whitespace
+                key.erase(0, key.find_first_not_of(" \t"));
+                key.erase(key.find_last_not_of(" \t") + 1);
+                value.erase(0, value.find_first_not_of(" \t"));
+                value.erase(value.find_last_not_of(" \t") + 1);
+
+                if (key == "description") current_workload.description = value;
+                else if (key == "file_size") current_workload.file_size = value;
+                else if (key == "block_size") current_workload.block_size = value;
+                else if (key == "runtime") current_workload.runtime = std::stoi(value);
+                else if (key == "numjobs") current_workload.numjobs = std::stoi(value);
+                else if (key == "iodepth") current_workload.iodepth = std::stoi(value);
+                else if (key == "pattern") current_workload.pattern = value;
+            }
+        }
+
+        // Add the last workload
+        if (!current_section.empty()) {
+            workloads[current_section] = current_workload;
+        }
+
+        file.close();
+        return !workloads.empty();
+    }
+
+public:
+    FairnessBenchmark() : config_file("fairness_configs.ini"),
+                          output_dir("fairness_results"),
+                          verbose(false) {}
+
+    void show_usage(const std::string& program_name) {
+        std::cout << "Usage: " << program_name << " [OPTIONS] [WORKLOAD]\n\n"
+                  << "Run fairness benchmark tests using fairness_configs.ini\n\n"
+                  << "WORKLOADS:\n"
+                  << "    steady_reader_d1      Steady 4k reader (iodepth=1) - 1G file\n"
+                  << "    steady_reader_d32     Steady 4k reader (iodepth=32) - 1G file\n"
+                  << "    steady_writer_d1      Steady 4k writer (iodepth=1) - 1G file\n"
+                  << "    steady_writer_d32     Steady 4k writer (iodepth=32) - 1G file\n"
+                  << "    bursty_reader_d1      Bursty 4k reader (iodepth=1) - 16G file\n"
+                  << "    bursty_reader_d32     Bursty 4k reader (iodepth=32) - 16G file\n"
+                  << "    bursty_writer_d1      Bursty 4k writer (iodepth=1) - 16G file\n"
+                  << "    bursty_writer_d32     Bursty 4k writer (iodepth=32) - 16G file\n"
+                  << "    all                   Run all workloads (default)\n\n"
+                  << "OPTIONS:\n"
+                  << "    -c, --config FILE     Use custom config file (default: fairness_configs.ini)\n"
+                  << "    -o, --output DIR      Output directory (default: fairness_results)\n"
+                  << "    -v, --verbose         Verbose output\n"
+                  << "    -h, --help            Show this help message\n\n"
+                  << "EXAMPLES:\n"
+                  << "    " << program_name << "                           # Run all fairness workloads\n"
+                  << "    " << program_name << " steady_reader_d1          # Run only steady reader with iodepth=1\n"
+                  << "    " << program_name << " -v bursty_writer_d32      # Run bursty writer with verbose output\n";
+    }
+
+    bool parse_args(int argc, char* argv[]) {
+        std::string workload = "all";
+
+        for (int i = 1; i < argc; i++) {
+            std::string arg = argv[i];
+
+            if (arg == "-c" || arg == "--config") {
+                if (i + 1 < argc) {
+                    config_file = argv[++i];
+                } else {
+                    log("ERROR: --config requires a filename");
+                    return false;
+                }
+            } else if (arg == "-o" || arg == "--output") {
+                if (i + 1 < argc) {
+                    output_dir = argv[++i];
+                } else {
+                    log("ERROR: --output requires a directory");
+                    return false;
+                }
+            } else if (arg == "-v" || arg == "--verbose") {
+                verbose = true;
+            } else if (arg == "-h" || arg == "--help") {
+                show_usage(argv[0]);
+                exit(0);
+            } else {
+                workload = arg;
+            }
+        }
+
+        return true;
+    }
+
+    int run(const std::string& workload) {
+        if (!check_dependencies()) {
+            return 1;
+        }
+
+        if (!parse_config_file()) {
+            log("ERROR: Failed to parse config file");
+            return 1;
+        }
+
+        log("Starting fairness benchmark");
+        log("Workload: " + workload + ", Config: " + config_file);
+
+        setup();
+
+        if (workload == "all") {
+            run_all_workloads();
+        } else {
+            if (!run_workload(workload)) {
+                return 1;
+            }
+        }
+
+        generate_summary();
+
+        log("✅ Fairness benchmark completed! Results in: " + output_dir);
+        return 0;
+    }
+};
+
+int main(int argc, char* argv[]) {
+    FairnessBenchmark benchmark;
+
+    if (!benchmark.parse_args(argc, argv)) {
+        return 1;
+    }
+
+    std::string workload = "all";
+    if (argc > 1) {
+        // Find the workload argument (the one that's not an option)
+        for (int i = 1; i < argc; i++) {
+            std::string arg = argv[i];
+            if (arg[0] != '-' &&
+                (i == 1 || (strcmp(argv[i-1], "-c") != 0 && strcmp(argv[i-1], "--config") != 0 &&
+                           strcmp(argv[i-1], "-o") != 0 && strcmp(argv[i-1], "--output") != 0))) {
+                workload = arg;
+                break;
+            }
+        }
+    }
+
+    return benchmark.run(workload);
+}
