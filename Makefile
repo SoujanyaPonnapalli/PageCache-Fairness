@@ -4,16 +4,21 @@ CXX = g++
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2
 TARGET = fairness_benchmark
 SOURCE = fairness_benchmark.cpp
+SEQ_TARGET = sequential_benchmark
+SEQ_SOURCE = sequential_benchmark.cpp
 
-# Default target
-all: $(TARGET)
+# Default target - build both benchmarks
+all: $(TARGET) $(SEQ_TARGET)
 
 $(TARGET): $(SOURCE)
 	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SOURCE)
 
+$(SEQ_TARGET): $(SEQ_SOURCE)
+	$(CXX) $(CXXFLAGS) -o $(SEQ_TARGET) $(SEQ_SOURCE)
+
 # Clean built files
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(SEQ_TARGET)
 
 # Install system dependencies
 install-deps:

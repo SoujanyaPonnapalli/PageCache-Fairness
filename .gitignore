@@ -1,5 +1,6 @@
 # C++ build artifacts
 fairness_benchmark
+sequential_benchmark
 *.o
 *.exe
 
@@ -17,6 +18,7 @@ test_file_*
 
 # Results and logs
 fairness_results/
+test_results/
 *.log
 *.csv
 *.iostat

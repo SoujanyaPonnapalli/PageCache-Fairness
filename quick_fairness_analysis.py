@@ -73,10 +73,29 @@ def analyze_fairness_results(results_dir):
 
     # Group results by workload
     workloads = {}
+    phase_results = {}
     for result in results:
         # Parse workload name from test_name
         # Format: workload_name_cached or workload_name_direct
+        # Or: workload_name_cached_phaseN or workload_name_direct_phaseN
         test_name = result['test_name']
+
+        # Check if this is a phase result
+        if '_phase' in test_name:
+            # Extract: workload_name_cached_phase1 -> workload_name, cached, phase1
+            parts = test_name.split('_')
+            phase_num = parts[-1]  # phase1, phase2, etc.
+            cache_mode = parts[-2]  # cached or direct
+            workload_name = '_'.join(parts[:-2])  # everything before cache_mode_phaseN
+
+            if workload_name not in phase_results:
+                phase_results[workload_name] = {}
+            if cache_mode not in phase_results[workload_name]:
+                phase_results[workload_name][cache_mode] = {}
+            phase_results[workload_name][cache_mode][phase_num] = result
+            continue
+
+        # Regular workload (not phase)
         if test_name.endswith('_cached') or test_name.endswith('_direct'):
             workload_name = test_name.rsplit('_', 1)[0]
             cache_mode = test_name.rsplit('_', 1)[1]
@@ -191,6 +210,58 @@ def analyze_fairness_results(results_dir):
 
         overall_avg = sum(imp['iops_imp'] for imp in improvements) / len(improvements)
         print(f"- **Overall average:** {overall_avg:+.1f}% IOPS improvement")
+
+    # Add phase-by-phase analysis if any multi-phase workloads exist
+    if phase_results:
+        print()
+        print("## 🔄 MULTI-PHASE WORKLOAD ANALYSIS")
+        print()
+        for workload_name in sorted(phase_results.keys()):
+            print(f"### {workload_name} (Phase-by-Phase)")
+            print()
+            phases = phase_results[workload_name]
+
+            # Get all phase numbers
+            all_phases = set()
+            if 'cached' in phases:
+                all_phases.update(phases['cached'].keys())
+            if 'direct' in phases:
+                all_phases.update(phases['direct'].keys())
+
+            for phase_num in sorted(all_phases):
+                print(f"**{phase_num.upper()}:**")
+                if 'cached' in phases and phase_num in phases['cached']:
+                    cached = phases['cached'][phase_num]
+                    if 'reader' in workload_name:
+                        print(f"- Cached:  {cached['read_iops']:>10.0f} IOPS, {cached['read_bw_mbs']:>7.1f} MB/s, {cached['read_lat_avg_us']:>7.1f}μs")
+                    else:
+                        print(f"- Cached:  {cached['write_iops']:>10.0f} IOPS, {cached['write_bw_mbs']:>7.1f} MB/s, {cached['write_lat_avg_us']:>7.1f}μs")
+
+                if 'direct' in phases and phase_num in phases['direct']:
+                    direct = phases['direct'][phase_num]
+                    if 'reader' in workload_name:
+                        print(f"- Direct:  {direct['read_iops']:>10.0f} IOPS, {direct['read_bw_mbs']:>7.1f} MB/s, {direct['read_lat_avg_us']:>7.1f}μs")
+                    else:
+                        print(f"- Direct:  {direct['write_iops']:>10.0f} IOPS, {direct['write_bw_mbs']:>7.1f} MB/s, {direct['write_lat_avg_us']:>7.1f}μs")
+
+                # Calculate improvement for this phase
+                if ('cached' in phases and phase_num in phases['cached'] and
+                    'direct' in phases and phase_num in phases['direct']):
+                    cached = phases['cached'][phase_num]
+                    direct = phases['direct'][phase_num]
+
+                    if 'reader' in workload_name:
+                        cached_iops = cached['read_iops']
+                        direct_iops = direct['read_iops']
+                    else:
+                        cached_iops = cached['write_iops']
+                        direct_iops = direct['write_iops']
+
+                    if direct_iops > 0:
+                        improvement = (cached_iops - direct_iops) / direct_iops * 100
+                        print(f"- Improvement: {improvement:+.1f}%")
+
+                print()
 
     print()
     print("## 💾 DETAILED WORKLOAD BREAKDOWN")

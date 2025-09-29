@@ -297,133 +297,6 @@ private:
         return true;
     }
 
-    bool run_concurrent_clients() {
-        // Find client1 and client2 in workloads
-        auto client1_it = workloads.find("client1_steady");
-        auto client2_it = workloads.find("client2_bursty");
-
-        if (client1_it == workloads.end() || client2_it == workloads.end()) {
-            log("ERROR: Dual-client mode requires 'client1_steady' and 'client2_bursty' in config");
-            return false;
-        }
-
-        log("Starting concurrent dual-client fairness test");
-        log("Client1 (steady): " + client1_it->second.description);
-        log("Client2 (bursty): " + client2_it->second.description);
-
-        // Create test files for both clients
-        std::string script_dir = fs::current_path().string();
-        std::string client1_file = script_dir + "/test_file_" + client1_it->second.file_size;
-        std::string client2_file = script_dir + "/test_file_" + client2_it->second.file_size;
-
-        create_test_file(client1_it->second.file_size, client1_file);
-        create_test_file(client2_it->second.file_size, client2_file);
-
-        // Test both cached and direct modes
-        std::vector<std::string> cache_modes = {"cached", "direct"};
-        for (const auto& cache_mode : cache_modes) {
-            log("Running mode: " + cache_mode);
-
-            // Start iostat monitoring
-            std::string iostat_file = output_dir + "/iostat/concurrent_" + cache_mode + ".iostat";
-            pid_t iostat_pid = fork();
-            if (iostat_pid == 0) {
-                freopen(iostat_file.c_str(), "w", stdout);
-                freopen("/dev/null", "w", stderr);
-                execl("/usr/bin/iostat", "iostat", "-d", "-w", "1", nullptr);
-                exit(1);
-            }
-
-            drop_caches();
-
-            // Spawn both clients concurrently
-            std::vector<pid_t> client_pids;
-
-            // Launch client1
-            pid_t client1_pid = fork();
-            if (client1_pid == 0) {
-                run_client_process("client1", client1_it->second, client1_file, cache_mode);
-                exit(0);
-            }
-            client_pids.push_back(client1_pid);
-
-            // Launch client2
-            pid_t client2_pid = fork();
-            if (client2_pid == 0) {
-                run_client_process("client2", client2_it->second, client2_file, cache_mode);
-                exit(0);
-            }
-            client_pids.push_back(client2_pid);
-
-            // Wait for both clients to complete
-            for (pid_t pid : client_pids) {
-                int status;
-                waitpid(pid, &status, 0);
-                if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-                    log("  ✓ Client completed successfully");
-                } else {
-                    log("  ✗ Client failed or was terminated");
-                }
-            }
-
-            // Stop iostat
-            if (iostat_pid > 0) {
-                kill(iostat_pid, SIGTERM);
-                waitpid(iostat_pid, nullptr, 0);
-            }
-
-            log("Completed mode: " + cache_mode);
-            sleep(2);
-        }
-
-        return true;
-    }
-
-    void run_client_process(const std::string& client_name, const WorkloadConfig& config,
-                           const std::string& test_file, const std::string& cache_mode) {
-        // Run all phases for this client
-        for (size_t phase_idx = 0; phase_idx < config.phases.size(); phase_idx++) {
-            const auto& phase = config.phases[phase_idx];
-            std::string phase_name = client_name + "_" + cache_mode + "_phase" + std::to_string(phase_idx + 1);
-            std::string phase_output = output_dir + "/" + phase_name + ".json";
-            std::string log_prefix = output_dir + "/" + phase_name;
-
-            // Build fio command with per-second logging
-            std::ostringstream fio_cmd;
-            fio_cmd << "fio"
-                    << " --name=" << phase_name
-                    << " --filename=" << test_file
-                    << " --size=" << config.file_size
-                    << " --runtime=" << phase.runtime
-                    << " --time_based=1"
-                    << " --rw=" << phase.pattern
-                    << " --bs=" << phase.block_size
-                    << " --numjobs=" << config.numjobs
-                    << " --iodepth=" << phase.iodepth;
-
-            if (!phase.ioengine.empty()) {
-                fio_cmd << " --ioengine=" << phase.ioengine;
-            }
-
-            // Add per-second logging
-            fio_cmd << " --log_avg_msec=1000"
-                    << " --write_lat_log=" << log_prefix
-                    << " --write_bw_log=" << log_prefix
-                    << " --write_iops_log=" << log_prefix;
-
-            fio_cmd << " --group_reporting=1"
-                    << " --output-format=json"
-                    << " --output=" << phase_output;
-
-            if (cache_mode == "direct") {
-                fio_cmd << " --direct=1";
-            }
-
-            // Execute fio
-            system(fio_cmd.str().c_str());
-        }
-    }
-
     void run_all_workloads() {
         log("Running all " + std::to_string(workloads.size()) + " fairness workloads...");
 
@@ -567,25 +440,27 @@ public:
                           verbose(false) {}
 
     void show_usage(const std::string& program_name) {
-        std::cout << "Usage: " << program_name << " [OPTIONS] [MODE]\n\n"
+        std::cout << "Usage: " << program_name << " [OPTIONS] [WORKLOAD]\n\n"
                   << "Run fairness benchmark tests using fairness_configs.ini\n\n"
-                  << "MODES:\n"
-                  << "    dual                  Run concurrent dual-client fairness test (default)\n"
-                  << "    all                   Run all sequential workloads\n"
-                  << "    <workload_name>       Run specific workload\n\n"
+                  << "WORKLOADS:\n"
+                  << "    steady_reader_d1      Steady 4k reader (iodepth=1) - 1G file\n"
+                  << "    steady_reader_d32     Steady 4k reader (iodepth=32) - 1G file\n"
+                  << "    steady_writer_d1      Steady 4k writer (iodepth=1) - 1G file\n"
+                  << "    steady_writer_d32     Steady 4k writer (iodepth=32) - 1G file\n"
+                  << "    bursty_reader_d1      Bursty 4k reader (iodepth=1) - 16G file\n"
+                  << "    bursty_reader_d32     Bursty 4k reader (iodepth=32) - 16G file\n"
+                  << "    bursty_writer_d1      Bursty 4k writer (iodepth=1) - 16G file\n"
+                  << "    bursty_writer_d32     Bursty 4k writer (iodepth=32) - 16G file\n"
+                  << "    all                   Run all workloads (default)\n\n"
                   << "OPTIONS:\n"
                   << "    -c, --config FILE     Use custom config file (default: fairness_configs.ini)\n"
                   << "    -o, --output DIR      Output directory (default: fairness_results)\n"
                   << "    -v, --verbose         Verbose output\n"
                   << "    -h, --help            Show this help message\n\n"
-                  << "DUAL-CLIENT MODE:\n"
-                  << "    Runs client1_steady and client2_bursty concurrently\n"
-                  << "    Logs per-second IOPS, bandwidth, and latency\n"
-                  << "    Monitors system I/O with iostat at 1-second intervals\n\n"
                   << "EXAMPLES:\n"
-                  << "    " << program_name << "                           # Run dual-client fairness test\n"
-                  << "    " << program_name << " dual                      # Run dual-client fairness test\n"
-                  << "    " << program_name << " -v dual                   # Run dual-client with verbose output\n";
+                  << "    " << program_name << "                           # Run all fairness workloads\n"
+                  << "    " << program_name << " steady_reader_d1          # Run only steady reader with iodepth=1\n"
+                  << "    " << program_name << " -v bursty_writer_d32      # Run bursty writer with verbose output\n";
     }
 
     bool parse_args(int argc, char* argv[]) {
@@ -621,7 +496,7 @@ public:
         return true;
     }
 
-    int run(const std::string& mode) {
+    int run(const std::string& workload) {
         if (!check_dependencies()) {
             return 1;
         }
@@ -632,26 +507,14 @@ public:
         }
 
         log("Starting fairness benchmark");
-        log("Mode: " + mode + ", Config: " + config_file);
+        log("Workload: " + workload + ", Config: " + config_file);
 
         setup();
 
-        // Check if config has dual-client setup
-        bool has_dual_clients = (workloads.find("client1_steady") != workloads.end() &&
-                                 workloads.find("client2_bursty") != workloads.end());
-
-        if (mode == "dual") {
-            if (!has_dual_clients) {
-                log("ERROR: Dual-client mode requires 'client1_steady' and 'client2_bursty' in config");
-                return 1;
-            }
-            if (!run_concurrent_clients()) {
-                return 1;
-            }
-        } else if (mode == "all") {
+        if (workload == "all") {
             run_all_workloads();
         } else {
-            if (!run_workload(mode)) {
+            if (!run_workload(workload)) {
                 return 1;
             }
         }
@@ -670,19 +533,19 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::string mode = "dual";  // Default to dual-client mode
+    std::string workload = "all";
     if (argc > 1) {
-        // Find the mode argument (the one that's not an option)
+        // Find the workload argument (the one that's not an option)
         for (int i = 1; i < argc; i++) {
             std::string arg = argv[i];
             if (arg[0] != '-' &&
                 (i == 1 || (strcmp(argv[i-1], "-c") != 0 && strcmp(argv[i-1], "--config") != 0 &&
                            strcmp(argv[i-1], "-o") != 0 && strcmp(argv[i-1], "--output") != 0))) {
-                mode = arg;
+                workload = arg;
                 break;
             }
         }
     }
 
-    return benchmark.run(mode);
+    return benchmark.run(workload);
 }
