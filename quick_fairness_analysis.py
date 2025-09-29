@@ -18,7 +18,6 @@ def load_fio_results(results_dir):
                 content = f.read()
 
             # Handle multiple JSON objects in one file
-            # Split by '}' and '{' pattern that indicates new JSON object
             json_objects = []
             decoder = json.JSONDecoder()
             idx = 0
@@ -59,6 +58,9 @@ def load_fio_results(results_dir):
                 'read_iops': read_metrics.get('iops', 0),
                 'write_iops': write_metrics.get('iops', 0),
                 'total_iops': read_metrics.get('iops', 0) + write_metrics.get('iops', 0),
+                'iops_min': read_metrics.get('iops_min', 0) if read_metrics.get('iops', 0) > 0 else write_metrics.get('iops_min', 0),
+                'iops_max': read_metrics.get('iops_max', 0) if read_metrics.get('iops', 0) > 0 else write_metrics.get('iops_max', 0),
+                'iops_stddev': read_metrics.get('iops_stddev', 0) if read_metrics.get('iops', 0) > 0 else write_metrics.get('iops_stddev', 0),
 
                 # Bandwidth (MB/s)
                 'read_bw_mbs': read_metrics.get('bw_bytes', 0) / 1024 / 1024,
@@ -79,6 +81,36 @@ def load_fio_results(results_dir):
 
     return results
 
+
+def get_iops(result):
+    """Helper: Get IOPS from result (read or write)."""
+    return result['read_iops'] if result['read_iops'] > 0 else result['write_iops']
+
+
+def get_bw(result):
+    """Helper: Get bandwidth from result (read or write)."""
+    return result['read_bw_mbs'] if result['read_iops'] > 0 else result['write_bw_mbs']
+
+
+def get_lat(result):
+    """Helper: Get latency from result (read or write)."""
+    return result['read_lat_avg_us'] if result['read_iops'] > 0 else result['write_lat_avg_us']
+
+
+def calculate_average_iops(phases):
+    """Helper: Calculate average IOPS across all phases."""
+    total = sum(get_iops(p) for p in phases.values())
+    return total / len(phases) if phases else 0
+
+
+def print_phase_metrics(result, label):
+    """Helper: Print metrics for a phase result."""
+    iops = get_iops(result)
+    bw = get_bw(result)
+    lat = get_lat(result)
+    print(f"- {label:7s} {iops:>10.0f} IOPS, {bw:>7.1f} MB/s, {lat:>7.1f}μs")
+
+
 def analyze_fairness_results(results_dir):
     """Quick analysis of fairness results without external dependencies."""
     results_path = Path(results_dir)
@@ -98,10 +130,8 @@ def analyze_fairness_results(results_dir):
     # Group results by workload
     workloads = {}
     phase_results = {}
+
     for result in results:
-        # Parse workload name from test_name
-        # Format: workload_name_cached or workload_name_direct
-        # Or: workload_name_cached_phaseN or workload_name_direct_phaseN
         test_name = result['test_name']
 
         # Check if this is a phase result
@@ -131,109 +161,102 @@ def analyze_fairness_results(results_dir):
 
         workloads[workload_name][cache_mode] = result
 
-    print("## 📊 WORKLOAD PERFORMANCE COMPARISON")
-    print()
-    print(f"{'Workload':<20} {'Mode':<8} {'IOPS':<12} {'BW(MB/s)':<10} {'Lat(μs)':<10}")
-    print("-" * 65)
-
-    improvements = []
-
-    for workload_name in sorted(workloads.keys()):
-        modes = workloads[workload_name]
-
-        if 'cached' in modes and 'direct' in modes:
-            cached = modes['cached']
-            direct = modes['direct']
-
-            # Use appropriate metrics based on workload type
-            if 'reader' in workload_name:
-                cached_iops = cached['read_iops']
-                cached_bw = cached['read_bw_mbs']
-                cached_lat = cached['read_lat_avg_us']
-                direct_iops = direct['read_iops']
-                direct_bw = direct['read_bw_mbs']
-                direct_lat = direct['read_lat_avg_us']
-            else:  # writer
-                cached_iops = cached['write_iops']
-                cached_bw = cached['write_bw_mbs']
-                cached_lat = cached['write_lat_avg_us']
-                direct_iops = direct['write_iops']
-                direct_bw = direct['write_bw_mbs']
-                direct_lat = direct['write_lat_avg_us']
-
-            print(f"{workload_name:<20} {'cached':<8} {cached_iops:<12.0f} {cached_bw:<10.1f} {cached_lat:<10.1f}")
-            print(f"{'':20} {'direct':<8} {direct_iops:<12.0f} {direct_bw:<10.1f} {direct_lat:<10.1f}")
-
-            # Calculate improvements
-            if direct_iops > 0:
-                iops_improvement = (cached_iops - direct_iops) / direct_iops * 100
-                bw_improvement = (cached_bw - direct_bw) / direct_bw * 100
-                lat_improvement = (direct_lat - cached_lat) / direct_lat * 100 if direct_lat > 0 else 0
-
-                print(f"{'':20} {'improve':<8} {iops_improvement:<+12.1f}% {bw_improvement:<+9.1f}% {lat_improvement:<+9.1f}%")
-
-                improvements.append({
-                    'workload': workload_name,
-                    'iops_imp': iops_improvement,
-                    'bw_imp': bw_improvement,
-                    'lat_imp': lat_improvement
-                })
-
-            print("-" * 65)
-
-    if improvements:
+    # Only show workload comparison if non-phase workloads exist
+    if workloads:
+        print("## 📊 WORKLOAD PERFORMANCE COMPARISON")
         print()
-        print("## 🔍 KEY INSIGHTS")
-        print()
+        print(f"{'Workload':<20} {'Mode':<8} {'IOPS':<12} {'BW(MB/s)':<10} {'Lat(μs)':<10}")
+        print("-" * 65)
 
-        # Category analysis
-        steady_improvements = [imp for imp in improvements if 'steady' in imp['workload']]
-        bursty_improvements = [imp for imp in improvements if 'bursty' in imp['workload']]
-        reader_improvements = [imp for imp in improvements if 'reader' in imp['workload']]
-        writer_improvements = [imp for imp in improvements if 'writer' in imp['workload']]
-        d1_improvements = [imp for imp in improvements if 'd1' in imp['workload']]
-        d32_improvements = [imp for imp in improvements if 'd32' in imp['workload']]
+        improvements = []
 
-        print("### By Workload Type:")
-        if steady_improvements:
-            avg_steady = sum(imp['iops_imp'] for imp in steady_improvements) / len(steady_improvements)
-            print(f"- **Steady (1G file):** {avg_steady:+.1f}% average IOPS improvement")
+        for workload_name in sorted(workloads.keys()):
+            modes = workloads[workload_name]
 
-        if bursty_improvements:
-            avg_bursty = sum(imp['iops_imp'] for imp in bursty_improvements) / len(bursty_improvements)
-            print(f"- **Bursty (16G file):** {avg_bursty:+.1f}% average IOPS improvement")
+            if 'cached' in modes and 'direct' in modes:
+                cached = modes['cached']
+                direct = modes['direct']
 
-        print()
-        print("### By I/O Pattern:")
-        if reader_improvements:
-            avg_read = sum(imp['iops_imp'] for imp in reader_improvements) / len(reader_improvements)
-            print(f"- **Readers:** {avg_read:+.1f}% average IOPS improvement")
+                cached_iops = get_iops(cached)
+                cached_bw = get_bw(cached)
+                cached_lat = get_lat(cached)
+                direct_iops = get_iops(direct)
+                direct_bw = get_bw(direct)
+                direct_lat = get_lat(direct)
 
-        if writer_improvements:
-            avg_write = sum(imp['iops_imp'] for imp in writer_improvements) / len(writer_improvements)
-            print(f"- **Writers:** {avg_write:+.1f}% average IOPS improvement")
+                print(f"{workload_name:<20} {'cached':<8} {cached_iops:<12.0f} {cached_bw:<10.1f} {cached_lat:<10.1f}")
+                print(f"{'':20} {'direct':<8} {direct_iops:<12.0f} {direct_bw:<10.1f} {direct_lat:<10.1f}")
 
-        print()
-        print("### By I/O Depth:")
-        if d1_improvements:
-            avg_d1 = sum(imp['iops_imp'] for imp in d1_improvements) / len(d1_improvements)
-            print(f"- **Depth=1:** {avg_d1:+.1f}% average IOPS improvement")
+                # Calculate improvements
+                if direct_iops > 0:
+                    iops_improvement = (cached_iops - direct_iops) / direct_iops * 100
+                    bw_improvement = (cached_bw - direct_bw) / direct_bw * 100
+                    lat_improvement = (direct_lat - cached_lat) / direct_lat * 100 if direct_lat > 0 else 0
 
-        if d32_improvements:
-            avg_d32 = sum(imp['iops_imp'] for imp in d32_improvements) / len(d32_improvements)
-            print(f"- **Depth=32:** {avg_d32:+.1f}% average IOPS improvement")
+                    print(f"{'':20} {'improve':<8} {iops_improvement:<+12.1f}% {bw_improvement:<+9.1f}% {lat_improvement:<+9.1f}%")
 
-        # Best and worst
-        best = max(improvements, key=lambda x: x['iops_imp'])
-        worst = min(improvements, key=lambda x: x['iops_imp'])
+                    improvements.append({
+                        'workload': workload_name,
+                        'iops_imp': iops_improvement,
+                        'bw_imp': bw_improvement,
+                        'lat_imp': lat_improvement
+                    })
 
-        print()
-        print("### Performance Extremes:")
-        print(f"- **Best pagecache benefit:** {best['workload']} ({best['iops_imp']:+.1f}% IOPS)")
-        print(f"- **Least pagecache benefit:** {worst['workload']} ({worst['iops_imp']:+.1f}% IOPS)")
+                print("-" * 65)
 
-        overall_avg = sum(imp['iops_imp'] for imp in improvements) / len(improvements)
-        print(f"- **Overall average:** {overall_avg:+.1f}% IOPS improvement")
+        if improvements:
+            print()
+            print("## 🔍 KEY INSIGHTS")
+            print()
+
+            # Category analysis
+            steady_improvements = [imp for imp in improvements if 'steady' in imp['workload']]
+            bursty_improvements = [imp for imp in improvements if 'bursty' in imp['workload']]
+            reader_improvements = [imp for imp in improvements if 'reader' in imp['workload']]
+            writer_improvements = [imp for imp in improvements if 'writer' in imp['workload']]
+            d1_improvements = [imp for imp in improvements if 'd1' in imp['workload']]
+            d32_improvements = [imp for imp in improvements if 'd32' in imp['workload']]
+
+            print("### By Workload Type:")
+            if steady_improvements:
+                avg_steady = sum(imp['iops_imp'] for imp in steady_improvements) / len(steady_improvements)
+                print(f"- **Steady (1G file):** {avg_steady:+.1f}% average IOPS improvement")
+
+            if bursty_improvements:
+                avg_bursty = sum(imp['iops_imp'] for imp in bursty_improvements) / len(bursty_improvements)
+                print(f"- **Bursty (16G file):** {avg_bursty:+.1f}% average IOPS improvement")
+
+            print()
+            print("### By I/O Pattern:")
+            if reader_improvements:
+                avg_read = sum(imp['iops_imp'] for imp in reader_improvements) / len(reader_improvements)
+                print(f"- **Readers:** {avg_read:+.1f}% average IOPS improvement")
+
+            if writer_improvements:
+                avg_write = sum(imp['iops_imp'] for imp in writer_improvements) / len(writer_improvements)
+                print(f"- **Writers:** {avg_write:+.1f}% average IOPS improvement")
+
+            print()
+            print("### By I/O Depth:")
+            if d1_improvements:
+                avg_d1 = sum(imp['iops_imp'] for imp in d1_improvements) / len(d1_improvements)
+                print(f"- **Depth=1:** {avg_d1:+.1f}% average IOPS improvement")
+
+            if d32_improvements:
+                avg_d32 = sum(imp['iops_imp'] for imp in d32_improvements) / len(d32_improvements)
+                print(f"- **Depth=32:** {avg_d32:+.1f}% average IOPS improvement")
+
+            # Best and worst
+            best = max(improvements, key=lambda x: x['iops_imp'])
+            worst = min(improvements, key=lambda x: x['iops_imp'])
+
+            print()
+            print("### Performance Extremes:")
+            print(f"- **Best pagecache benefit:** {best['workload']} ({best['iops_imp']:+.1f}% IOPS)")
+            print(f"- **Least pagecache benefit:** {worst['workload']} ({worst['iops_imp']:+.1f}% IOPS)")
+
+            overall_avg = sum(imp['iops_imp'] for imp in improvements) / len(improvements)
+            print(f"- **Overall average:** {overall_avg:+.1f}% IOPS improvement")
 
     # Add phase-by-phase analysis if any multi-phase workloads exist
     if phase_results:
@@ -254,32 +277,18 @@ def analyze_fairness_results(results_dir):
 
             for phase_num in sorted(all_phases):
                 print(f"**{phase_num.upper()}:**")
+
                 if 'cached' in phases and phase_num in phases['cached']:
-                    cached = phases['cached'][phase_num]
-                    if 'reader' in workload_name:
-                        print(f"- Cached:  {cached['read_iops']:>10.0f} IOPS, {cached['read_bw_mbs']:>7.1f} MB/s, {cached['read_lat_avg_us']:>7.1f}μs")
-                    else:
-                        print(f"- Cached:  {cached['write_iops']:>10.0f} IOPS, {cached['write_bw_mbs']:>7.1f} MB/s, {cached['write_lat_avg_us']:>7.1f}μs")
+                    print_phase_metrics(phases['cached'][phase_num], "Cached:")
 
                 if 'direct' in phases and phase_num in phases['direct']:
-                    direct = phases['direct'][phase_num]
-                    if 'reader' in workload_name:
-                        print(f"- Direct:  {direct['read_iops']:>10.0f} IOPS, {direct['read_bw_mbs']:>7.1f} MB/s, {direct['read_lat_avg_us']:>7.1f}μs")
-                    else:
-                        print(f"- Direct:  {direct['write_iops']:>10.0f} IOPS, {direct['write_bw_mbs']:>7.1f} MB/s, {direct['write_lat_avg_us']:>7.1f}μs")
+                    print_phase_metrics(phases['direct'][phase_num], "Direct:")
 
                 # Calculate improvement for this phase
                 if ('cached' in phases and phase_num in phases['cached'] and
                     'direct' in phases and phase_num in phases['direct']):
-                    cached = phases['cached'][phase_num]
-                    direct = phases['direct'][phase_num]
-
-                    if 'reader' in workload_name:
-                        cached_iops = cached['read_iops']
-                        direct_iops = direct['read_iops']
-                    else:
-                        cached_iops = cached['write_iops']
-                        direct_iops = direct['write_iops']
+                    cached_iops = get_iops(phases['cached'][phase_num])
+                    direct_iops = get_iops(phases['direct'][phase_num])
 
                     if direct_iops > 0:
                         improvement = (cached_iops - direct_iops) / direct_iops * 100
@@ -287,42 +296,156 @@ def analyze_fairness_results(results_dir):
 
                 print()
 
-    print()
-    print("## 💾 DETAILED WORKLOAD BREAKDOWN")
-    print()
-
-    for workload_name in sorted(workloads.keys()):
-        modes = workloads[workload_name]
-        print(f"### {workload_name}")
-
-        # Parse workload characteristics
-        if 'steady' in workload_name:
-            print("- **Type:** Sequential I/O on small file (1G)")
-        elif 'bursty' in workload_name:
-            print("- **Type:** Random I/O on large file (16G)")
-
-        if 'reader' in workload_name:
-            print("- **Pattern:** Read operations")
-        elif 'writer' in workload_name:
-            print("- **Pattern:** Write operations")
-
-        if 'd1' in workload_name:
-            print("- **Concurrency:** Low (iodepth=1)")
-        elif 'd32' in workload_name:
-            print("- **Concurrency:** High (iodepth=32)")
-
-        if 'cached' in modes and 'direct' in modes:
-            cached = modes['cached']
-            direct = modes['direct']
-
-            if 'reader' in workload_name:
-                print(f"- **Cached Results:** {cached['read_iops']:.0f} IOPS, {cached['read_bw_mbs']:.1f} MB/s, {cached['read_lat_avg_us']:.1f}μs")
-                print(f"- **Direct Results:** {direct['read_iops']:.0f} IOPS, {direct['read_bw_mbs']:.1f} MB/s, {direct['read_lat_avg_us']:.1f}μs")
-            else:
-                print(f"- **Cached Results:** {cached['write_iops']:.0f} IOPS, {cached['write_bw_mbs']:.1f} MB/s, {cached['write_lat_avg_us']:.1f}μs")
-                print(f"- **Direct Results:** {direct['write_iops']:.0f} IOPS, {direct['write_bw_mbs']:.1f} MB/s, {direct['write_lat_avg_us']:.1f}μs")
-
+    # Add comprehensive fairness and stability analysis for dual-client mode
+    if phase_results and 'client1' in phase_results and 'client2' in phase_results:
         print()
+        print("## ⚖️  DUAL-CLIENT FAIRNESS & STABILITY ANALYSIS")
+        print("=" * 75)
+
+        # Phase stability analysis
+        print("\n### Phase Stability Analysis")
+        print("-" * 75)
+
+        stability_summary = []
+
+        for client_name in ['client1', 'client2']:
+            if client_name not in phase_results:
+                continue
+
+            client_phases = phase_results[client_name]
+
+            for cache_mode in ['cached', 'direct']:
+                if cache_mode not in client_phases:
+                    continue
+
+                phases = client_phases[cache_mode]
+                phase_keys = sorted(phases.keys())
+
+                if len(phase_keys) < 2:
+                    continue
+
+                # Get IOPS for first and last phase
+                p1_iops = get_iops(phases[phase_keys[0]])
+                p2_iops = get_iops(phases[phase_keys[-1]])
+
+                if p1_iops > 0:
+                    change_pct = ((p2_iops - p1_iops) / p1_iops) * 100
+                    stability_summary.append({
+                        'name': f"{client_name.title()} {cache_mode.title()}",
+                        'change': change_pct,
+                        'abs_change': abs(change_pct),
+                        'p1_iops': p1_iops,
+                        'p2_iops': p2_iops
+                    })
+
+                    print(f"\n**{client_name.upper()} {cache_mode.upper()}:**")
+                    print(f"  Phase1: {p1_iops:>12,.0f} IOPS")
+                    print(f"  Phase2: {p2_iops:>12,.0f} IOPS")
+                    print(f"  Change: {change_pct:>12.2f}%")
+
+                    if abs(change_pct) < 1:
+                        print(f"  ✅ Excellent stability (< 1% variation)")
+                    elif abs(change_pct) < 5:
+                        print(f"  ✓ Good stability (< 5% variation)")
+                    else:
+                        print(f"  ⚠️  Poor stability (> 5% variation)")
+
+        # Stability ranking
+        if stability_summary:
+            print("\n### Stability Ranking (Most Unstable → Most Stable)")
+            print("-" * 75)
+            stability_summary.sort(key=lambda x: x['abs_change'], reverse=True)
+
+            for i, item in enumerate(stability_summary, 1):
+                status = "⚠️ " if item['abs_change'] > 5 else "✓" if item['abs_change'] > 1 else "✅"
+                print(f"{i}. {status} {item['name']:25s}: {item['change']:+7.2f}%")
+
+        # Client comparison (fairness)
+        print("\n\n### Client Fairness Comparison")
+        print("-" * 75)
+
+        for cache_mode in ['cached', 'direct']:
+            if ('client1' in phase_results and cache_mode in phase_results['client1'] and
+                'client2' in phase_results and cache_mode in phase_results['client2']):
+
+                c1_avg = calculate_average_iops(phase_results['client1'][cache_mode])
+                c2_avg = calculate_average_iops(phase_results['client2'][cache_mode])
+
+                if c2_avg > 0:
+                    ratio = c1_avg / c2_avg
+
+                    print(f"\n**{cache_mode.upper()} MODE:**")
+                    print(f"  Client1 avg: {c1_avg:>12,.0f} IOPS")
+                    print(f"  Client2 avg: {c2_avg:>12,.0f} IOPS")
+                    print(f"  Ratio:       {ratio:>12.2f}x")
+
+                    if abs(ratio - 1.0) < 0.1:
+                        print(f"  ✅ Excellent fairness (~1:1 ratio)")
+                    elif abs(ratio - 1.0) < 0.5:
+                        print(f"  ✓ Good fairness")
+                    else:
+                        print(f"  ⚠️  Unfair resource distribution")
+
+        # Variance analysis (intra-phase stability)
+        print("\n\n### Intra-Phase Variance Analysis")
+        print("-" * 75)
+        print("Measures performance consistency WITHIN each 30-second phase\n")
+
+        for client_name in ['client1', 'client2']:
+            if client_name not in phase_results:
+                continue
+
+            client_phases = phase_results[client_name]
+            print(f"\n**{client_name.upper()}:**")
+
+            for cache_mode in ['cached', 'direct']:
+                if cache_mode not in client_phases:
+                    continue
+
+                print(f"  {cache_mode.title()}:")
+
+                for phase_key in sorted(client_phases[cache_mode].keys()):
+                    phase = client_phases[cache_mode][phase_key]
+                    iops = get_iops(phase)
+                    iops_stddev = phase['iops_stddev']
+
+                    if iops > 0:
+                        cv = (iops_stddev / iops) * 100  # Coefficient of variation
+                        print(f"    {phase_key}: CoV = {cv:>5.2f}% (σ={iops_stddev:>8,.0f} IOPS)")
+
+        # Pagecache benefit comparison
+        print("\n\n### Pagecache Benefit Analysis")
+        print("-" * 75)
+
+        for client_name in ['client1', 'client2']:
+            if client_name not in phase_results:
+                continue
+
+            if 'cached' not in phase_results[client_name] or 'direct' not in phase_results[client_name]:
+                continue
+
+            cached_avg = calculate_average_iops(phase_results[client_name]['cached'])
+            direct_avg = calculate_average_iops(phase_results[client_name]['direct'])
+
+            if direct_avg > 0:
+                benefit_pct = ((cached_avg - direct_avg) / direct_avg) * 100
+
+                print(f"\n**{client_name.upper()}:**")
+                print(f"  Cached avg:  {cached_avg:>12,.0f} IOPS")
+                print(f"  Direct avg:  {direct_avg:>12,.0f} IOPS")
+                print(f"  Benefit:     {benefit_pct:>12.2f}%")
+
+                if benefit_pct < -10:
+                    print(f"  ⚠️  Pagecache HURTS performance significantly")
+                elif benefit_pct < 0:
+                    print(f"  ⚠️  Pagecache slightly degrades performance")
+                elif benefit_pct < 10:
+                    print(f"  ✓ Modest pagecache benefit")
+                else:
+                    print(f"  ✅ Strong pagecache benefit")
+
+    print()
+
 
 def main():
     if len(sys.argv) < 2:
@@ -331,6 +454,7 @@ def main():
 
     results_dir = sys.argv[1]
     analyze_fairness_results(results_dir)
+
 
 if __name__ == '__main__':
     main()
