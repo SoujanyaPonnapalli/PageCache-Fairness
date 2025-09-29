@@ -145,6 +145,13 @@ private:
                 key.erase(key.find_last_not_of(" \t") + 1);
                 value.erase(0, value.find_first_not_of(" \t"));
 
+                // Strip inline comments (everything after #)
+                size_t comment_pos = value.find('#');
+                if (comment_pos != std::string::npos) {
+                    value = value.substr(0, comment_pos);
+                    value.erase(value.find_last_not_of(" \t") + 1);
+                }
+
                 if (key == "cgroup_name") {
                     current_cgroup.cgroup_name = value;
                 } else {
