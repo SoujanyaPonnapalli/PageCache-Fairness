@@ -209,16 +209,23 @@ private:
             std::string check_cmd = "test -f " + setting_file;
             if (system(check_cmd.c_str()) != 0) {
                 // File doesn't exist, controller might not be enabled
+                fail_count++;
+                if (verbose) {
+                    log("WARNING: Controller file not found: " + key + " for cgroup " + cgroup.cgroup_name);
+                }
                 continue;
             }
 
             std::string set_cmd = "echo '" + value + "' | sudo tee " + setting_file + " > /dev/null 2>&1";
             if (system(set_cmd.c_str()) == 0) {
                 success_count++;
+                if (verbose) {
+                    log("✓ Set " + key + " = " + value + " for cgroup " + cgroup.cgroup_name);
+                }
             } else {
                 fail_count++;
                 if (verbose) {
-                    log("WARNING: Failed to set " + key + " for cgroup " + cgroup.cgroup_name);
+                    log("WARNING: Failed to set " + key + " = " + value + " for cgroup " + cgroup.cgroup_name);
                 }
             }
         }
