@@ -172,7 +172,19 @@ private:
         }
 
         const auto& cgroup = it->second;
-        std::string cgroup_path = "/sys/fs/cgroup/" + cgroup.cgroup_name;
+
+        // For systemd-managed systems, use systemd slice hierarchy
+        // Check if running under systemd
+        std::string systemd_check = "test -d /sys/fs/cgroup/system.slice 2>/dev/null";
+        bool is_systemd = (system(systemd_check.c_str()) == 0);
+
+        std::string cgroup_path;
+        if (is_systemd) {
+            // Create under user.slice or a custom slice
+            cgroup_path = "/sys/fs/cgroup/user.slice/" + cgroup.cgroup_name;
+        } else {
+            cgroup_path = "/sys/fs/cgroup/" + cgroup.cgroup_name;
+        }
 
         // Create cgroup directory
         std::string mkdir_cmd = "sudo mkdir -p " + cgroup_path + " 2>/dev/null";
@@ -182,8 +194,8 @@ private:
         }
 
         // Enable controllers in parent cgroup first
-        // This is required for cgroup v2
-        std::string enable_controllers = "echo '+cpu +memory +io' | sudo tee /sys/fs/cgroup/cgroup.subtree_control > /dev/null 2>&1";
+        std::string parent_path = is_systemd ? "/sys/fs/cgroup/user.slice" : "/sys/fs/cgroup";
+        std::string enable_controllers = "echo '+cpu +memory +io' | sudo tee " + parent_path + "/cgroup.subtree_control > /dev/null 2>&1";
         system(enable_controllers.c_str());
 
         // Apply cgroup settings
@@ -214,6 +226,8 @@ private:
         if (success_count > 0) {
             log("Setup cgroup: " + cgroup.cgroup_name + " (" + std::to_string(success_count) +
                 " settings applied, " + std::to_string(fail_count) + " failed)");
+        } else if (is_systemd) {
+            log("INFO: Running under systemd - cgroup controllers managed by systemd");
         } else {
             log("WARNING: No cgroup settings applied for " + cgroup.cgroup_name + " (controllers may not be available)");
         }
@@ -228,12 +242,25 @@ private:
         if (it == cgroups.end()) return true;
 
         const auto& cgroup = it->second;
-        std::string cgroup_path = "/sys/fs/cgroup/" + cgroup.cgroup_name;
+
+        // Determine the correct path (systemd vs non-systemd)
+        std::string systemd_check = "test -d /sys/fs/cgroup/system.slice 2>/dev/null";
+        bool is_systemd = (system(systemd_check.c_str()) == 0);
+
+        std::string cgroup_path;
+        if (is_systemd) {
+            cgroup_path = "/sys/fs/cgroup/user.slice/" + cgroup.cgroup_name;
+        } else {
+            cgroup_path = "/sys/fs/cgroup/" + cgroup.cgroup_name;
+        }
+
         std::string procs_file = cgroup_path + "/cgroup.procs";
 
         std::string add_cmd = "echo " + std::to_string(pid) + " | sudo tee " + procs_file + " > /dev/null 2>&1";
         if (system(add_cmd.c_str()) != 0) {
-            log("WARNING: Failed to add PID " + std::to_string(pid) + " to cgroup " + cgroup.cgroup_name);
+            if (verbose) {
+                log("WARNING: Failed to add PID " + std::to_string(pid) + " to cgroup " + cgroup.cgroup_name);
+            }
             return false;
         }
 
