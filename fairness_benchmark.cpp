@@ -51,6 +51,7 @@ private:
     std::map<std::string, CgroupConfig> cgroups;
     std::string cgroup_config_file;
     bool use_cgroups;
+    std::string cache_mode_filter;  // "both", "cached", or "direct"
 
     std::string get_timestamp() {
         auto now = std::chrono::system_clock::now();
@@ -339,8 +340,13 @@ private:
         std::string test_file = script_dir + "/test_file_" + config.file_size;
         create_test_file(config.file_size, test_file);
 
-        // Test both cached and direct modes
-        std::vector<std::string> cache_modes = {"cached", "direct"};
+        // Test cached and/or direct modes based on filter
+        std::vector<std::string> cache_modes;
+        if (cache_mode_filter == "both") {
+            cache_modes = {"cached", "direct"};
+        } else {
+            cache_modes = {cache_mode_filter};
+        }
         for (const auto& cache_mode : cache_modes) {
             std::string test_name = workload_name + "_" + cache_mode;
             std::string output_file = output_dir + "/" + test_name + ".json";
@@ -508,8 +514,13 @@ private:
         create_test_file(client1_it->second.file_size, client1_file);
         create_test_file(client2_it->second.file_size, client2_file);
 
-        // Test both cached and direct modes
-        std::vector<std::string> cache_modes = {"cached", "direct"};
+        // Test cached and/or direct modes based on filter
+        std::vector<std::string> cache_modes;
+        if (cache_mode_filter == "both") {
+            cache_modes = {"cached", "direct"};
+        } else {
+            cache_modes = {cache_mode_filter};
+        }
         for (const auto& cache_mode : cache_modes) {
             log("Running mode: " + cache_mode);
 
@@ -763,7 +774,8 @@ public:
                           output_dir("fairness_results"),
                           verbose(false),
                           cgroup_config_file("cgroup_config.ini"),
-                          use_cgroups(true) {}
+                          use_cgroups(true),
+                          cache_mode_filter("both") {}
 
     void show_usage(const std::string& program_name) {
         std::cout << "Usage: " << program_name << " [OPTIONS] [MODE]\n\n"
@@ -775,6 +787,8 @@ public:
                   << "OPTIONS:\n"
                   << "    -c, --config FILE     Use custom config file (default: fairness_configs.ini)\n"
                   << "    -o, --output DIR      Output directory (default: fairness_results)\n"
+                  << "    -m, --mode MODE       Cache mode: both, cached, or direct (default: both)\n"
+                  << "    --no-cgroup           Disable cgroup configuration\n"
                   << "    -v, --verbose         Verbose output\n"
                   << "    -h, --help            Show this help message\n\n"
                   << "DUAL-CLIENT MODE:\n"
@@ -782,8 +796,11 @@ public:
                   << "    Logs per-second IOPS, bandwidth, and latency\n"
                   << "    Monitors system I/O with iostat at 1-second intervals\n\n"
                   << "EXAMPLES:\n"
-                  << "    " << program_name << "                           # Run dual-client fairness test\n"
-                  << "    " << program_name << " dual                      # Run dual-client fairness test\n"
+                  << "    " << program_name << "                           # Run dual-client fairness test (both modes)\n"
+                  << "    " << program_name << " dual                      # Run dual-client fairness test (both modes)\n"
+                  << "    " << program_name << " -m cached dual            # Run dual-client in cached mode only\n"
+                  << "    " << program_name << " -m direct dual            # Run dual-client in direct mode only\n"
+                  << "    " << program_name << " --no-cgroup dual          # Run without cgroup configuration\n"
                   << "    " << program_name << " -v dual                   # Run dual-client with verbose output\n";
     }
 
@@ -807,6 +824,19 @@ public:
                     log("ERROR: --output requires a directory");
                     return false;
                 }
+            } else if (arg == "-m" || arg == "--mode") {
+                if (i + 1 < argc) {
+                    cache_mode_filter = argv[++i];
+                    if (cache_mode_filter != "both" && cache_mode_filter != "cached" && cache_mode_filter != "direct") {
+                        log("ERROR: --mode must be 'both', 'cached', or 'direct'");
+                        return false;
+                    }
+                } else {
+                    log("ERROR: --mode requires a value (both, cached, or direct)");
+                    return false;
+                }
+            } else if (arg == "--no-cgroup") {
+                use_cgroups = false;
             } else if (arg == "-v" || arg == "--verbose") {
                 verbose = true;
             } else if (arg == "-h" || arg == "--help") {
@@ -835,6 +865,7 @@ public:
 
         log("Starting fairness benchmark");
         log("Mode: " + mode + ", Config: " + config_file);
+        log("Cache mode: " + cache_mode_filter + ", Cgroups: " + (use_cgroups ? "enabled" : "disabled"));
 
         setup();
 
