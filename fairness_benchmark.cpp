@@ -100,9 +100,14 @@ private:
     }
 
     void drop_caches() {
+        log("Dropping page caches...");
         system("sync");
+        // Linux: drop page cache, dentries, and inodes
+        system("echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null 2>&1 || true");
+        // macOS: purge
         system("sudo purge 2>/dev/null || true");
         sleep(1);
+        system("sync");
     }
 
     bool parse_cgroup_config() {
