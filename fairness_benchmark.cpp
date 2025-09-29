@@ -37,12 +37,20 @@ struct WorkloadConfig {
     std::vector<PhaseConfig> phases;
 };
 
+struct CgroupConfig {
+    std::string cgroup_name;
+    std::map<std::string, std::string> settings;
+};
+
 class FairnessBenchmark {
 private:
     std::string config_file;
     std::string output_dir;
     bool verbose;
     std::map<std::string, WorkloadConfig> workloads;
+    std::map<std::string, CgroupConfig> cgroups;
+    std::string cgroup_config_file;
+    bool use_cgroups;
 
     std::string get_timestamp() {
         auto now = std::chrono::system_clock::now();
@@ -94,6 +102,115 @@ private:
         system("sync");
         system("sudo purge 2>/dev/null || true");
         sleep(1);
+    }
+
+    bool parse_cgroup_config() {
+        if (!fs::exists(cgroup_config_file)) {
+            log("Cgroup config file not found: " + cgroup_config_file + ", skipping cgroups");
+            use_cgroups = false;
+            return true;
+        }
+
+        std::ifstream file(cgroup_config_file);
+        if (!file.is_open()) {
+            log("WARNING: Could not open cgroup config file, skipping cgroups");
+            use_cgroups = false;
+            return true;
+        }
+
+        std::string line;
+        std::string current_client;
+        CgroupConfig current_cgroup;
+
+        while (std::getline(file, line)) {
+            line.erase(0, line.find_first_not_of(" \t"));
+            line.erase(line.find_last_not_of(" \t\r\n") + 1);
+
+            if (line.empty() || line[0] == '#') continue;
+
+            if (line[0] == '[') {
+                if (!current_client.empty()) {
+                    cgroups[current_client] = current_cgroup;
+                }
+                current_client = line.substr(1, line.find(']') - 1);
+                current_cgroup = CgroupConfig();
+                current_cgroup.settings.clear();
+                continue;
+            }
+
+            size_t eq_pos = line.find('=');
+            if (eq_pos != std::string::npos) {
+                std::string key = line.substr(0, eq_pos);
+                std::string value = line.substr(eq_pos + 1);
+                key.erase(key.find_last_not_of(" \t") + 1);
+                value.erase(0, value.find_first_not_of(" \t"));
+
+                if (key == "cgroup_name") {
+                    current_cgroup.cgroup_name = value;
+                } else {
+                    current_cgroup.settings[key] = value;
+                }
+            }
+        }
+
+        if (!current_client.empty()) {
+            cgroups[current_client] = current_cgroup;
+        }
+
+        file.close();
+        log("Loaded cgroup config for " + std::to_string(cgroups.size()) + " clients");
+        return true;
+    }
+
+    bool setup_cgroup(const std::string& client_name) {
+        if (!use_cgroups) return true;
+
+        auto it = cgroups.find(client_name);
+        if (it == cgroups.end()) {
+            log("WARNING: No cgroup config for " + client_name + ", running without cgroup");
+            return true;
+        }
+
+        const auto& cgroup = it->second;
+        std::string cgroup_path = "/sys/fs/cgroup/" + cgroup.cgroup_name;
+
+        // Create cgroup directory
+        std::string mkdir_cmd = "sudo mkdir -p " + cgroup_path + " 2>/dev/null";
+        if (system(mkdir_cmd.c_str()) != 0) {
+            log("WARNING: Failed to create cgroup " + cgroup_path + ", running without cgroup");
+            return true;
+        }
+
+        // Apply cgroup settings
+        for (const auto& [key, value] : cgroup.settings) {
+            std::string setting_file = cgroup_path + "/" + key;
+            std::string set_cmd = "echo '" + value + "' | sudo tee " + setting_file + " > /dev/null 2>&1";
+            if (system(set_cmd.c_str()) != 0) {
+                log("WARNING: Failed to set " + key + " for cgroup " + cgroup.cgroup_name);
+            }
+        }
+
+        log("Setup cgroup: " + cgroup.cgroup_name + " for " + client_name);
+        return true;
+    }
+
+    bool add_pid_to_cgroup(const std::string& client_name, pid_t pid) {
+        if (!use_cgroups) return true;
+
+        auto it = cgroups.find(client_name);
+        if (it == cgroups.end()) return true;
+
+        const auto& cgroup = it->second;
+        std::string cgroup_path = "/sys/fs/cgroup/" + cgroup.cgroup_name;
+        std::string procs_file = cgroup_path + "/cgroup.procs";
+
+        std::string add_cmd = "echo " + std::to_string(pid) + " | sudo tee " + procs_file + " > /dev/null 2>&1";
+        if (system(add_cmd.c_str()) != 0) {
+            log("WARNING: Failed to add PID " + std::to_string(pid) + " to cgroup " + cgroup.cgroup_name);
+            return false;
+        }
+
+        return true;
     }
 
     uintmax_t get_size_bytes(const std::string& size_str) {
@@ -311,6 +428,10 @@ private:
         log("Client1 (steady): " + client1_it->second.description);
         log("Client2 (bursty): " + client2_it->second.description);
 
+        // Setup cgroups for both clients
+        setup_cgroup("client1_steady");
+        setup_cgroup("client2_bursty");
+
         // Create test files for both clients
         std::string script_dir = fs::current_path().string();
         std::string client1_file = script_dir + "/test_file_" + client1_it->second.file_size;
@@ -342,18 +463,26 @@ private:
             // Launch client1
             pid_t client1_pid = fork();
             if (client1_pid == 0) {
+                // Add self to cgroup
+                add_pid_to_cgroup("client1_steady", getpid());
                 run_client_process("client1", client1_it->second, client1_file, cache_mode);
                 exit(0);
             }
             client_pids.push_back(client1_pid);
+            // Add child to cgroup from parent side
+            add_pid_to_cgroup("client1_steady", client1_pid);
 
             // Launch client2
             pid_t client2_pid = fork();
             if (client2_pid == 0) {
+                // Add self to cgroup
+                add_pid_to_cgroup("client2_bursty", getpid());
                 run_client_process("client2", client2_it->second, client2_file, cache_mode);
                 exit(0);
             }
             client_pids.push_back(client2_pid);
+            // Add child to cgroup from parent side
+            add_pid_to_cgroup("client2_bursty", client2_pid);
 
             // Wait for both clients to complete
             for (pid_t pid : client_pids) {
@@ -564,7 +693,9 @@ private:
 public:
     FairnessBenchmark() : config_file("fairness_configs.ini"),
                           output_dir("fairness_results"),
-                          verbose(false) {}
+                          verbose(false),
+                          cgroup_config_file("cgroup_config.ini"),
+                          use_cgroups(true) {}
 
     void show_usage(const std::string& program_name) {
         std::cout << "Usage: " << program_name << " [OPTIONS] [MODE]\n\n"
@@ -630,6 +761,9 @@ public:
             log("ERROR: Failed to parse config file");
             return 1;
         }
+
+        // Parse cgroup configuration
+        parse_cgroup_config();
 
         log("Starting fairness benchmark");
         log("Mode: " + mode + ", Config: " + config_file);

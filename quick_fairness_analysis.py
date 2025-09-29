@@ -15,9 +15,33 @@ def load_fio_results(results_dir):
     for json_file in json_files:
         try:
             with open(json_file, 'r') as f:
-                data = json.load(f)
+                content = f.read()
 
-            if 'jobs' not in data or not data['jobs']:
+            # Handle multiple JSON objects in one file
+            # Split by '}' and '{' pattern that indicates new JSON object
+            json_objects = []
+            decoder = json.JSONDecoder()
+            idx = 0
+            content_to_parse = content
+            while idx < len(content_to_parse):
+                remaining = content_to_parse[idx:].lstrip()
+                if not remaining:
+                    break
+                try:
+                    obj, end_idx = decoder.raw_decode(remaining)
+                    if isinstance(obj, dict):
+                        json_objects.append(obj)
+                    idx += len(content_to_parse[idx:]) - len(remaining) + end_idx
+                except json.JSONDecodeError:
+                    break
+
+            # Use the last JSON object (most recent run)
+            if not json_objects:
+                continue
+
+            data = json_objects[-1]
+
+            if not isinstance(data, dict) or 'jobs' not in data or not data['jobs']:
                 continue
 
             job = data['jobs'][0]
