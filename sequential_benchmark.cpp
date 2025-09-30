@@ -59,6 +59,11 @@ private:
                   << "] " << message << std::endl;
     }
 
+    // Helper to suppress unused result warnings for system calls we don't care about
+    void run_system(const std::string& cmd) {
+        [[maybe_unused]] int result = system(cmd.c_str());
+    }
+
     bool check_dependencies() {
         if (system("which fio > /dev/null 2>&1") != 0) {
             log("ERROR: fio is required but not installed");
@@ -91,8 +96,8 @@ private:
     }
 
     void drop_caches() {
-        system("sync");
-        system("sudo purge 2>/dev/null || true");
+        run_system("sync");
+        run_system("sudo purge 2>/dev/null || true");
         sleep(1);
     }
 
@@ -123,7 +128,7 @@ private:
             log("ERROR: Unsupported file size: " + file_size);
             exit(1);
         }
-        system(cmd.c_str());
+        run_system(cmd);
         log("Test file created: " + test_file);
     }
 
@@ -166,8 +171,8 @@ private:
             // Start iostat monitoring
             pid_t iostat_pid = fork();
             if (iostat_pid == 0) {
-                freopen(iostat_file.c_str(), "w", stdout);
-                freopen("/dev/null", "w", stderr);
+                [[maybe_unused]] FILE* out = freopen(iostat_file.c_str(), "w", stdout);
+                [[maybe_unused]] FILE* err = freopen("/dev/null", "w", stderr);
                 execl("/usr/bin/iostat", "iostat", "-d", "-w", "1", nullptr);
                 exit(1);
             }
@@ -213,10 +218,10 @@ private:
                     // Run phase
                     if (verbose) {
                         log("    Executing: " + fio_cmd.str());
-                        system(fio_cmd.str().c_str());
+                        run_system(fio_cmd.str());
                     } else {
                         std::string silent_cmd = fio_cmd.str() + " >/dev/null 2>&1";
-                        system(silent_cmd.c_str());
+                        run_system(silent_cmd);
                     }
 
                     // Don't drop caches between phases - maintain state
@@ -272,10 +277,10 @@ private:
                 // Run test
                 if (verbose) {
                     log("  Executing: " + fio_cmd.str());
-                    system(fio_cmd.str().c_str());
+                    run_system(fio_cmd.str());
                 } else {
                     std::string silent_cmd = fio_cmd.str() + " >/dev/null 2>&1";
-                    system(silent_cmd.c_str());
+                    run_system(silent_cmd);
                 }
             }
 

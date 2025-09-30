@@ -68,6 +68,11 @@ private:
                   << "] " << message << std::endl;
     }
 
+    // Helper to suppress unused result warnings for system calls we don't care about
+    void run_system(const std::string& cmd) {
+        [[maybe_unused]] int result = system(cmd.c_str());
+    }
+
     bool check_dependencies() {
         if (system("which fio > /dev/null 2>&1") != 0) {
             log("ERROR: fio is required but not installed");
@@ -132,11 +137,11 @@ private:
 
             // Kill any processes in the cgroup first
             std::string kill_cmd = "sudo kill -9 $(cat " + cgroup_path + "/cgroup.procs 2>/dev/null) 2>/dev/null || true";
-            system(kill_cmd.c_str());
+            run_system(kill_cmd);
 
             // Remove the cgroup directory
             std::string rmdir_cmd = "sudo rmdir " + cgroup_path + " 2>/dev/null || true";
-            system(rmdir_cmd.c_str());
+            run_system(rmdir_cmd);
 
             if (verbose) {
                 log("  Removed cgroup: " + cgroup.cgroup_name);
@@ -146,20 +151,20 @@ private:
         // Also try to remove parent "clients" cgroup if it exists
         std::string parent_path = base_path + "/clients";
         std::string kill_parent = "sudo kill -9 $(cat " + parent_path + "/cgroup.procs 2>/dev/null) 2>/dev/null || true";
-        system(kill_parent.c_str());
+        run_system(kill_parent);
         std::string rmdir_parent = "sudo rmdir " + parent_path + " 2>/dev/null || true";
-        system(rmdir_parent.c_str());
+        run_system(rmdir_parent);
     }
 
     void drop_caches() {
         log("Dropping page caches...");
-        system("sync");
+        run_system("sync");
         // Linux: drop page cache, dentries, and inodes
-        system("echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null 2>&1 || true");
+        run_system("echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null 2>&1 || true");
         // macOS: purge
-        system("sudo purge 2>/dev/null || true");
+        run_system("sudo purge 2>/dev/null || true");
         sleep(1);
-        system("sync");
+        run_system("sync");
     }
 
     bool parse_cgroup_config() {
@@ -263,7 +268,7 @@ private:
 
         // Enable controllers in base path
         std::string enable_cmd = "echo '+cpu +memory +io' | sudo tee " + base_path + "/cgroup.subtree_control > /dev/null 2>&1";
-        system(enable_cmd.c_str());
+        run_system(enable_cmd);
 
         // If cgroup_name contains '/', enable controllers in intermediate directories
         size_t slash_pos = cgroup.cgroup_name.find('/');
@@ -273,11 +278,11 @@ private:
 
             // Create intermediate directory
             std::string mkdir_intermediate = "sudo mkdir -p " + intermediate_path + " 2>/dev/null";
-            system(mkdir_intermediate.c_str());
+            run_system(mkdir_intermediate);
 
             // Enable controllers in intermediate directory
             std::string enable_intermediate = "echo '+cpu +memory +io' | sudo tee " + intermediate_path + "/cgroup.subtree_control > /dev/null 2>&1";
-            system(enable_intermediate.c_str());
+            run_system(enable_intermediate);
         }
 
         // Apply cgroup settings
@@ -412,7 +417,7 @@ private:
             << " bs=1M count=" << count
             << " 2>/dev/null";
 
-        system(cmd.str().c_str());
+        run_system(cmd.str());
         log("Test file created: " + test_file);
     }
 
@@ -460,8 +465,8 @@ private:
             // Start iostat monitoring
             pid_t iostat_pid = fork();
             if (iostat_pid == 0) {
-                freopen(iostat_file.c_str(), "w", stdout);
-                freopen("/dev/null", "w", stderr);
+                [[maybe_unused]] FILE* out = freopen(iostat_file.c_str(), "w", stdout);
+                [[maybe_unused]] FILE* err = freopen("/dev/null", "w", stderr);
                 execl("/usr/bin/iostat", "iostat", "-d", "-w", "1", nullptr);
                 exit(1);
             }
@@ -507,10 +512,10 @@ private:
                     // Run phase
                     if (verbose) {
                         log("    Executing: " + fio_cmd.str());
-                        system(fio_cmd.str().c_str());
+                        run_system(fio_cmd.str());
                     } else {
                         std::string silent_cmd = fio_cmd.str() + " >/dev/null 2>&1";
-                        system(silent_cmd.c_str());
+                        run_system(silent_cmd);
                     }
 
                     // Don't drop caches between phases - maintain state
@@ -566,10 +571,10 @@ private:
                 // Run test
                 if (verbose) {
                     log("  Executing: " + fio_cmd.str());
-                    system(fio_cmd.str().c_str());
+                    run_system(fio_cmd.str());
                 } else {
                     std::string silent_cmd = fio_cmd.str() + " >/dev/null 2>&1";
-                    system(silent_cmd.c_str());
+                    run_system(silent_cmd);
                 }
             }
 
@@ -627,8 +632,8 @@ private:
             std::string iostat_file = output_dir + "/iostat/concurrent_" + cache_mode + ".iostat";
             pid_t iostat_pid = fork();
             if (iostat_pid == 0) {
-                freopen(iostat_file.c_str(), "w", stdout);
-                freopen("/dev/null", "w", stderr);
+                [[maybe_unused]] FILE* out = freopen(iostat_file.c_str(), "w", stdout);
+                [[maybe_unused]] FILE* err = freopen("/dev/null", "w", stderr);
                 execl("/usr/bin/iostat", "iostat", "-d", "-w", "1", nullptr);
                 exit(1);
             }
@@ -727,7 +732,7 @@ private:
             }
 
             // Execute fio
-            system(fio_cmd.str().c_str());
+            run_system(fio_cmd.str());
         }
     }
 
