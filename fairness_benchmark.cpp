@@ -99,6 +99,58 @@ private:
         metadata.close();
     }
 
+    void setup_all_cgroups() {
+        if (!use_cgroups) return;
+
+        log("Setting up cgroups...");
+
+        // Clean up any existing cgroups first
+        cleanup_cgroups();
+
+        // Setup all configured cgroups
+        for (const auto& [client_name, cgroup] : cgroups) {
+            setup_cgroup(client_name);
+        }
+    }
+
+    void cleanup_cgroups() {
+        if (!use_cgroups) return;
+
+        if (verbose) {
+            log("Cleaning up cgroups...");
+        }
+
+        // Determine if running under systemd
+        std::string systemd_check = "test -d /sys/fs/cgroup/system.slice 2>/dev/null";
+        bool is_systemd = (system(systemd_check.c_str()) == 0);
+
+        std::string base_path = is_systemd ? "/sys/fs/cgroup/user.slice" : "/sys/fs/cgroup";
+
+        // Remove all configured cgroups
+        for (const auto& [client_name, cgroup] : cgroups) {
+            std::string cgroup_path = base_path + "/" + cgroup.cgroup_name;
+
+            // Kill any processes in the cgroup first
+            std::string kill_cmd = "sudo kill -9 $(cat " + cgroup_path + "/cgroup.procs 2>/dev/null) 2>/dev/null || true";
+            system(kill_cmd.c_str());
+
+            // Remove the cgroup directory
+            std::string rmdir_cmd = "sudo rmdir " + cgroup_path + " 2>/dev/null || true";
+            system(rmdir_cmd.c_str());
+
+            if (verbose) {
+                log("  Removed cgroup: " + cgroup.cgroup_name);
+            }
+        }
+
+        // Also try to remove parent "clients" cgroup if it exists
+        std::string parent_path = base_path + "/clients";
+        std::string kill_parent = "sudo kill -9 $(cat " + parent_path + "/cgroup.procs 2>/dev/null) 2>/dev/null || true";
+        system(kill_parent.c_str());
+        std::string rmdir_parent = "sudo rmdir " + parent_path + " 2>/dev/null || true";
+        system(rmdir_parent.c_str());
+    }
+
     void drop_caches() {
         log("Dropping page caches...");
         system("sync");
@@ -305,9 +357,29 @@ private:
     }
 
     uintmax_t get_size_bytes(const std::string& size_str) {
-        if (size_str == "1G") return 1ULL * 1024 * 1024 * 1024;
-        if (size_str == "16G") return 16ULL * 1024 * 1024 * 1024;
-        return 0;
+        // Parse size strings like "1G", "16G", "512M", "2T", etc.
+        if (size_str.empty()) return 0;
+
+        uintmax_t multiplier = 1;
+        char unit = size_str.back();
+
+        // Determine multiplier based on unit
+        if (unit == 'K' || unit == 'k') {
+            multiplier = 1024ULL;
+        } else if (unit == 'M' || unit == 'm') {
+            multiplier = 1024ULL * 1024;
+        } else if (unit == 'G' || unit == 'g') {
+            multiplier = 1024ULL * 1024 * 1024;
+        } else if (unit == 'T' || unit == 't') {
+            multiplier = 1024ULL * 1024 * 1024 * 1024;
+        } else {
+            // No unit, assume bytes
+            return std::stoull(size_str);
+        }
+
+        // Extract numeric part
+        std::string numeric = size_str.substr(0, size_str.length() - 1);
+        return std::stoull(numeric) * multiplier;
     }
 
     void create_test_file(const std::string& file_size, const std::string& test_file) {
@@ -322,16 +394,25 @@ private:
         }
 
         log("Creating " + file_size + " test file: " + test_file);
-        std::string cmd;
-        if (file_size == "1G") {
-            cmd = "dd if=/dev/zero of=" + test_file + " bs=1M count=1024 2>/dev/null";
-        } else if (file_size == "16G") {
-            cmd = "dd if=/dev/zero of=" + test_file + " bs=1M count=16384 2>/dev/null";
-        } else {
-            log("ERROR: Unsupported file size: " + file_size);
+
+        // Parse size to determine dd parameters
+        uintmax_t size_bytes = get_size_bytes(file_size);
+        if (size_bytes == 0) {
+            log("ERROR: Invalid file size: " + file_size);
             exit(1);
         }
-        system(cmd.c_str());
+
+        // Use 1MB block size and calculate count
+        uintmax_t block_size = 1024 * 1024; // 1MB
+        uintmax_t count = size_bytes / block_size;
+
+        // Build dd command
+        std::ostringstream cmd;
+        cmd << "dd if=/dev/urandom of=" << test_file
+            << " bs=1M count=" << count
+            << " 2>/dev/null";
+
+        system(cmd.str().c_str());
         log("Test file created: " + test_file);
     }
 
@@ -440,7 +521,7 @@ private:
                 if (config.phases.size() > 0) {
                     // Try phases in reverse order, use first non-empty one
                     bool merged = false;
-                    for (int phase_idx = config.phases.size(); phase_idx >= 1 && !merged; phase_idx--) {
+                    for (size_t phase_idx = config.phases.size(); phase_idx >= 1 && !merged; phase_idx--) {
                         std::string phase_file = output_dir + "/" + test_name + "_phase" +
                                                 std::to_string(phase_idx) + ".json";
                         if (fs::exists(phase_file) && fs::file_size(phase_file) > 0) {
@@ -523,10 +604,6 @@ private:
         log("Starting concurrent dual-client fairness test");
         log("Client1 (steady): " + client1_it->second.description);
         log("Client2 (bursty): " + client2_it->second.description);
-
-        // Setup cgroups for both clients
-        setup_cgroup("client1_steady");
-        setup_cgroup("client2_bursty");
 
         // Create test files for both clients
         std::string script_dir = fs::current_path().string();
@@ -900,6 +977,9 @@ public:
 
         setup();
 
+        // Setup all cgroups once at the beginning
+        setup_all_cgroups();
+
         // Check if config has dual-client setup
         bool has_dual_clients = (workloads.find("client1_steady") != workloads.end() &&
                                  workloads.find("client2_bursty") != workloads.end());
@@ -921,6 +1001,9 @@ public:
         }
 
         generate_summary();
+
+        // Final cleanup
+        cleanup_cgroups();
 
         log("✅ Fairness benchmark completed! Results in: " + output_dir);
         return 0;
