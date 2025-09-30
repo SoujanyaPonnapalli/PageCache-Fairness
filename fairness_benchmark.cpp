@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <fstream>
 #include <filesystem>
 #include <chrono>
@@ -21,6 +22,8 @@ struct PhaseConfig {
     int iodepth;
     std::string pattern;
     std::string ioengine;
+    int numjobs;          // Per-phase numjobs (0 = use workload default)
+    std::string file_size; // Per-phase file_size (empty = use workload default)
 };
 
 struct WorkloadConfig {
@@ -480,20 +483,31 @@ private:
                     std::string phase_name = test_name + "_phase" + std::to_string(phase_idx + 1);
                     std::string phase_output = output_dir + "/" + phase_name + ".json";
 
+                    // Use per-phase values with fallback to workload defaults
+                    std::string phase_file_size = phase.file_size.empty() ? config.file_size : phase.file_size;
+                    int phase_numjobs = (phase.numjobs > 0) ? phase.numjobs : config.numjobs;
+                    std::string phase_test_file = script_dir + "/test_file_" + phase_file_size;
+
+                    // Create test file for this phase if different from default
+                    if (phase_file_size != config.file_size) {
+                        create_test_file(phase_file_size, phase_test_file);
+                    }
+
                     log("    Phase " + std::to_string(phase_idx + 1) + "/" + std::to_string(config.phases.size()) +
-                        ": " + phase.pattern + " for " + std::to_string(phase.runtime) + "s");
+                        ": " + phase.pattern + " for " + std::to_string(phase.runtime) + "s" +
+                        " (file=" + phase_file_size + ", jobs=" + std::to_string(phase_numjobs) + ")");
 
                     // Build fio command for this phase
                     std::ostringstream fio_cmd;
                     fio_cmd << "fio"
                             << " --name=" << phase_name
-                            << " --filename=" << test_file
-                            << " --size=" << config.file_size
+                            << " --filename=" << phase_test_file
+                            << " --size=" << phase_file_size
                             << " --runtime=" << phase.runtime
                             << " --time_based=1"
                             << " --rw=" << phase.pattern
                             << " --bs=" << phase.block_size
-                            << " --numjobs=" << config.numjobs
+                            << " --numjobs=" << phase_numjobs
                             << " --iodepth=" << phase.iodepth;
 
                     if (!phase.ioengine.empty()) {
@@ -610,13 +624,34 @@ private:
         log("Client1 (steady): " + client1_it->second.description);
         log("Client2 (bursty): " + client2_it->second.description);
 
-        // Create test files for both clients
+        // Create test files for both clients (including per-phase file sizes)
         std::string script_dir = fs::current_path().string();
+
+        // Collect all unique file sizes used by client1
+        std::set<std::string> all_file_sizes;
+        all_file_sizes.insert(client1_it->second.file_size);
+        for (const auto& phase : client1_it->second.phases) {
+            if (!phase.file_size.empty()) {
+                all_file_sizes.insert(phase.file_size);
+            }
+        }
+
+        // Collect all unique file sizes used by client2
+        all_file_sizes.insert(client2_it->second.file_size);
+        for (const auto& phase : client2_it->second.phases) {
+            if (!phase.file_size.empty()) {
+                all_file_sizes.insert(phase.file_size);
+            }
+        }
+
+        // Create all unique test files
+        for (const auto& file_size : all_file_sizes) {
+            std::string test_file = script_dir + "/test_file_" + file_size;
+            create_test_file(file_size, test_file);
+        }
+
         std::string client1_file = script_dir + "/test_file_" + client1_it->second.file_size;
         std::string client2_file = script_dir + "/test_file_" + client2_it->second.file_size;
-
-        create_test_file(client1_it->second.file_size, client1_file);
-        create_test_file(client2_it->second.file_size, client2_file);
 
         // Test cached and/or direct modes based on filter
         std::vector<std::string> cache_modes;
@@ -693,6 +728,9 @@ private:
 
     void run_client_process(const std::string& client_name, const WorkloadConfig& config,
                            const std::string& test_file, const std::string& cache_mode) {
+        // Get script directory for creating test files
+        std::string script_dir = fs::current_path().string();
+
         // Run all phases for this client
         for (size_t phase_idx = 0; phase_idx < config.phases.size(); phase_idx++) {
             const auto& phase = config.phases[phase_idx];
@@ -700,17 +738,27 @@ private:
             std::string phase_output = output_dir + "/" + phase_name + ".json";
             std::string log_prefix = output_dir + "/" + phase_name;
 
+            // Use per-phase values with fallback to workload defaults
+            std::string phase_file_size = phase.file_size.empty() ? config.file_size : phase.file_size;
+            int phase_numjobs = (phase.numjobs > 0) ? phase.numjobs : config.numjobs;
+            std::string phase_test_file = script_dir + "/test_file_" + phase_file_size;
+
+            // Create test file for this phase if different from default
+            if (phase_file_size != config.file_size && !fs::exists(phase_test_file)) {
+                create_test_file(phase_file_size, phase_test_file);
+            }
+
             // Build fio command with per-second logging
             std::ostringstream fio_cmd;
             fio_cmd << "fio"
                     << " --name=" << phase_name
-                    << " --filename=" << test_file
-                    << " --size=" << config.file_size
+                    << " --filename=" << phase_test_file
+                    << " --size=" << phase_file_size
                     << " --runtime=" << phase.runtime
                     << " --time_based=1"
                     << " --rw=" << phase.pattern
                     << " --bs=" << phase.block_size
-                    << " --numjobs=" << config.numjobs
+                    << " --numjobs=" << phase_numjobs
                     << " --iodepth=" << phase.iodepth;
 
             if (!phase.ioengine.empty()) {
@@ -838,7 +886,7 @@ private:
 
                         // Initialize phase if needed
                         if (phase_map.find(phase_num) == phase_map.end()) {
-                            phase_map[phase_num] = PhaseConfig{0, "", 0, "", ""};
+                            phase_map[phase_num] = PhaseConfig{0, "", 0, "", "", 0, ""};
                         }
 
                         if (param == "runtime") phase_map[phase_num].runtime = std::stoi(value);
@@ -846,6 +894,8 @@ private:
                         else if (param == "iodepth") phase_map[phase_num].iodepth = std::stoi(value);
                         else if (param == "pattern") phase_map[phase_num].pattern = value;
                         else if (param == "ioengine") phase_map[phase_num].ioengine = value;
+                        else if (param == "numjobs") phase_map[phase_num].numjobs = std::stoi(value);
+                        else if (param == "file_size") phase_map[phase_num].file_size = value;
                     }
                 }
                 // Legacy single-phase parameters
