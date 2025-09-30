@@ -650,9 +650,6 @@ private:
             create_test_file(file_size, test_file);
         }
 
-        std::string client1_file = script_dir + "/test_file_" + client1_it->second.file_size;
-        std::string client2_file = script_dir + "/test_file_" + client2_it->second.file_size;
-
         // Test cached and/or direct modes based on filter
         std::vector<std::string> cache_modes;
         if (cache_mode_filter == "both") {
@@ -683,7 +680,7 @@ private:
             if (client1_pid == 0) {
                 // Add self to cgroup
                 add_pid_to_cgroup("client1_steady", getpid());
-                run_client_process("client1", client1_it->second, client1_file, cache_mode);
+                run_client_process("client1", client1_it->second, cache_mode);
                 exit(0);
             }
             client_pids.push_back(client1_pid);
@@ -695,7 +692,7 @@ private:
             if (client2_pid == 0) {
                 // Add self to cgroup
                 add_pid_to_cgroup("client2_bursty", getpid());
-                run_client_process("client2", client2_it->second, client2_file, cache_mode);
+                run_client_process("client2", client2_it->second, cache_mode);
                 exit(0);
             }
             client_pids.push_back(client2_pid);
@@ -727,7 +724,7 @@ private:
     }
 
     void run_client_process(const std::string& client_name, const WorkloadConfig& config,
-                           const std::string& test_file, const std::string& cache_mode) {
+                           const std::string& cache_mode) {
         // Get script directory for creating test files
         std::string script_dir = fs::current_path().string();
 
