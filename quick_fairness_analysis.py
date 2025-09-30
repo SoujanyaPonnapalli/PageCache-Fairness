@@ -50,6 +50,22 @@ def load_fio_results(results_dir):
             read_metrics = job.get('read', {})
             write_metrics = job.get('write', {})
 
+            # Helper to get p99 from clat_ns or lat_ns
+            def get_p99_ns(metrics):
+                # Try clat_ns first (completion latency - most common)
+                clat = metrics.get('clat_ns', {})
+                if 'percentile' in clat:
+                    p99 = clat['percentile'].get('99.000000', 0)
+                    if p99 > 0:
+                        return p99
+
+                # Fallback to lat_ns
+                lat = metrics.get('lat_ns', {})
+                if 'percentile' in lat:
+                    return lat['percentile'].get('99.000000', 0)
+
+                return 0
+
             result = {
                 'test_name': test_name,
                 'file_path': str(json_file),
@@ -70,8 +86,8 @@ def load_fio_results(results_dir):
                 # Latency (microseconds)
                 'read_lat_avg_us': read_metrics.get('lat_ns', {}).get('mean', 0) / 1000,
                 'write_lat_avg_us': write_metrics.get('lat_ns', {}).get('mean', 0) / 1000,
-                'read_lat_p99_us': read_metrics.get('lat_ns', {}).get('percentile', {}).get('99.000000', 0) / 1000,
-                'write_lat_p99_us': write_metrics.get('lat_ns', {}).get('percentile', {}).get('99.000000', 0) / 1000,
+                'read_lat_p99_us': get_p99_ns(read_metrics) / 1000,
+                'write_lat_p99_us': get_p99_ns(write_metrics) / 1000,
             }
 
             results.append(result)
