@@ -790,23 +790,25 @@ public:
                   << "    all                   Run all sequential workloads\n"
                   << "    <workload_name>       Run specific workload\n\n"
                   << "OPTIONS:\n"
-                  << "    -c, --config FILE     Use custom config file (default: fairness_configs.ini)\n"
-                  << "    -o, --output DIR      Output directory (default: fairness_results)\n"
-                  << "    -m, --mode MODE       Cache mode: both, cached, or direct (default: both)\n"
-                  << "    --no-cgroup           Disable cgroup configuration\n"
-                  << "    -v, --verbose         Verbose output\n"
-                  << "    -h, --help            Show this help message\n\n"
+                  << "    -c, --config FILE        Use custom config file (default: fairness_configs.ini)\n"
+                  << "    -o, --output DIR         Output directory (default: fairness_results)\n"
+                  << "    -m, --mode MODE          Cache mode: both, cached, or direct (default: both)\n"
+                  << "    --cgroup-config FILE     Use custom cgroup config file (default: cgroup_config.ini)\n"
+                  << "    --no-cgroup              Disable cgroup configuration\n"
+                  << "    -v, --verbose            Verbose output\n"
+                  << "    -h, --help               Show this help message\n\n"
                   << "DUAL-CLIENT MODE:\n"
                   << "    Runs client1_steady and client2_bursty concurrently\n"
                   << "    Logs per-second IOPS, bandwidth, and latency\n"
                   << "    Monitors system I/O with iostat at 1-second intervals\n\n"
                   << "EXAMPLES:\n"
-                  << "    " << program_name << "                           # Run dual-client fairness test (both modes)\n"
-                  << "    " << program_name << " dual                      # Run dual-client fairness test (both modes)\n"
-                  << "    " << program_name << " -m cached dual            # Run dual-client in cached mode only\n"
-                  << "    " << program_name << " -m direct dual            # Run dual-client in direct mode only\n"
-                  << "    " << program_name << " --no-cgroup dual          # Run without cgroup configuration\n"
-                  << "    " << program_name << " -v dual                   # Run dual-client with verbose output\n";
+                  << "    " << program_name << "                                    # Run dual-client fairness test (both modes)\n"
+                  << "    " << program_name << " dual                               # Run dual-client fairness test (both modes)\n"
+                  << "    " << program_name << " -m cached dual                     # Run dual-client in cached mode only\n"
+                  << "    " << program_name << " -m direct dual                     # Run dual-client in direct mode only\n"
+                  << "    " << program_name << " --cgroup-config custom.ini dual    # Use custom cgroup config\n"
+                  << "    " << program_name << " --no-cgroup dual                   # Run without cgroup configuration\n"
+                  << "    " << program_name << " -v dual                            # Run dual-client with verbose output\n";
     }
 
     bool parse_args(int argc, char* argv[]) {
@@ -838,6 +840,13 @@ public:
                     }
                 } else {
                     log("ERROR: --mode requires a value (both, cached, or direct)");
+                    return false;
+                }
+            } else if (arg == "--cgroup-config") {
+                if (i + 1 < argc) {
+                    cgroup_config_file = argv[++i];
+                } else {
+                    log("ERROR: --cgroup-config requires a filename");
                     return false;
                 }
             } else if (arg == "--no-cgroup") {
@@ -915,7 +924,9 @@ int main(int argc, char* argv[]) {
             std::string arg = argv[i];
             if (arg[0] != '-' &&
                 (i == 1 || (strcmp(argv[i-1], "-c") != 0 && strcmp(argv[i-1], "--config") != 0 &&
-                           strcmp(argv[i-1], "-o") != 0 && strcmp(argv[i-1], "--output") != 0))) {
+                           strcmp(argv[i-1], "-o") != 0 && strcmp(argv[i-1], "--output") != 0 &&
+                           strcmp(argv[i-1], "-m") != 0 && strcmp(argv[i-1], "--mode") != 0 &&
+                           strcmp(argv[i-1], "--cgroup-config") != 0))) {
                 mode = arg;
                 break;
             }
