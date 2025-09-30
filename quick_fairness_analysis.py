@@ -66,6 +66,20 @@ def load_fio_results(results_dir):
 
                 return 0
 
+            # Helper to get max from clat_ns or lat_ns
+            def get_max_ns(metrics):
+                # Try clat_ns first (completion latency - most common)
+                clat = metrics.get('clat_ns', {})
+                if 'max' in clat:
+                    return clat['max']
+
+                # Fallback to lat_ns
+                lat = metrics.get('lat_ns', {})
+                if 'max' in lat:
+                    return lat['max']
+
+                return 0
+
             result = {
                 'test_name': test_name,
                 'file_path': str(json_file),
@@ -88,6 +102,8 @@ def load_fio_results(results_dir):
                 'write_lat_avg_us': write_metrics.get('lat_ns', {}).get('mean', 0) / 1000,
                 'read_lat_p99_us': get_p99_ns(read_metrics) / 1000,
                 'write_lat_p99_us': get_p99_ns(write_metrics) / 1000,
+                'read_lat_max_us': get_max_ns(read_metrics) / 1000,
+                'write_lat_max_us': get_max_ns(write_metrics) / 1000,
             }
 
             results.append(result)
@@ -118,6 +134,11 @@ def get_lat_p99(result):
     return result['read_lat_p99_us'] if result['read_iops'] > 0 else result['write_lat_p99_us']
 
 
+def get_lat_max(result):
+    """Helper: Get max latency from result (read or write)."""
+    return result['read_lat_max_us'] if result['read_iops'] > 0 else result['write_lat_max_us']
+
+
 def calculate_average_iops(phases):
     """Helper: Calculate average IOPS across all phases."""
     total = sum(get_iops(p) for p in phases.values())
@@ -130,7 +151,8 @@ def print_phase_metrics(result, label):
     bw = get_bw(result)
     lat = get_lat(result)
     lat_p99 = get_lat_p99(result)
-    print(f"- {label:7s} {iops:>10.0f} IOPS, {bw:>7.1f} MB/s, {lat:>7.1f}μs avg, {lat_p99:>7.1f}μs p99")
+    lat_max = get_lat_max(result)
+    print(f"- {label:7s} {iops:>10.0f} IOPS, {bw:>7.1f} MB/s, {lat:>7.1f}μs avg, {lat_p99:>7.1f}μs p99, {lat_max:>8.1f}μs max")
 
 
 def analyze_fairness_results(results_dir):

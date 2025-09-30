@@ -3,6 +3,7 @@
 #include <vector>
 #include <map>
 #include <set>
+#include <algorithm>
 #include <fstream>
 #include <filesystem>
 #include <chrono>
@@ -117,8 +118,23 @@ private:
         // Clean up any existing cgroups first
         cleanup_cgroups();
 
-        // Setup all configured cgroups
+        // Sort cgroups by path depth (parents before children)
+        // Count '/' characters in cgroup_name to determine depth
+        std::vector<std::pair<std::string, int>> sorted_cgroups;
         for (const auto& [client_name, cgroup] : cgroups) {
+            int depth = std::count(cgroup.cgroup_name.begin(), cgroup.cgroup_name.end(), '/');
+            sorted_cgroups.push_back({client_name, depth});
+        }
+
+        // Sort by depth (ascending)
+        std::sort(sorted_cgroups.begin(), sorted_cgroups.end(),
+                  [](const auto& a, const auto& b) { return a.second < b.second; });
+
+        // Setup all configured cgroups in order (parents first)
+        for (const auto& [client_name, depth] : sorted_cgroups) {
+            if (verbose) {
+                log("  Setting up cgroup for " + client_name + " (depth=" + std::to_string(depth) + ")");
+            }
             setup_cgroup(client_name);
         }
     }
@@ -136,8 +152,20 @@ private:
 
         std::string base_path = is_systemd ? "/sys/fs/cgroup/user.slice" : "/sys/fs/cgroup";
 
-        // Remove all configured cgroups
+        // Sort cgroups by path depth (children before parents for cleanup)
+        std::vector<std::pair<std::string, int>> sorted_cgroups;
         for (const auto& [client_name, cgroup] : cgroups) {
+            int depth = std::count(cgroup.cgroup_name.begin(), cgroup.cgroup_name.end(), '/');
+            sorted_cgroups.push_back({client_name, depth});
+        }
+
+        // Sort by depth (descending - deepest first)
+        std::sort(sorted_cgroups.begin(), sorted_cgroups.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+
+        // Remove all configured cgroups in reverse order (children before parents)
+        for (const auto& [client_name, depth] : sorted_cgroups) {
+            const auto& cgroup = cgroups[client_name];
             std::string cgroup_path = base_path + "/" + cgroup.cgroup_name;
 
             // Kill any processes in the cgroup first
