@@ -199,17 +199,34 @@ private:
             cgroup_path = "/sys/fs/cgroup/" + cgroup.cgroup_name;
         }
 
-        // Create cgroup directory
+        // Create cgroup directory (may be nested like clients/client1)
         std::string mkdir_cmd = "sudo mkdir -p " + cgroup_path + " 2>/dev/null";
         if (system(mkdir_cmd.c_str()) != 0) {
             log("WARNING: Failed to create cgroup " + cgroup_path + ", running without cgroup");
             return true;
         }
 
-        // Enable controllers in parent cgroup first
-        std::string parent_path = is_systemd ? "/sys/fs/cgroup/user.slice" : "/sys/fs/cgroup";
-        std::string enable_controllers = "echo '+cpu +memory +io' | sudo tee " + parent_path + "/cgroup.subtree_control > /dev/null 2>&1";
-        system(enable_controllers.c_str());
+        // Enable controllers in all parent directories up to root
+        std::string base_path = is_systemd ? "/sys/fs/cgroup/user.slice" : "/sys/fs/cgroup";
+
+        // Enable controllers in base path
+        std::string enable_cmd = "echo '+cpu +memory +io' | sudo tee " + base_path + "/cgroup.subtree_control > /dev/null 2>&1";
+        system(enable_cmd.c_str());
+
+        // If cgroup_name contains '/', enable controllers in intermediate directories
+        size_t slash_pos = cgroup.cgroup_name.find('/');
+        if (slash_pos != std::string::npos) {
+            std::string intermediate = cgroup.cgroup_name.substr(0, slash_pos);
+            std::string intermediate_path = base_path + "/" + intermediate;
+
+            // Create intermediate directory
+            std::string mkdir_intermediate = "sudo mkdir -p " + intermediate_path + " 2>/dev/null";
+            system(mkdir_intermediate.c_str());
+
+            // Enable controllers in intermediate directory
+            std::string enable_intermediate = "echo '+cpu +memory +io' | sudo tee " + intermediate_path + "/cgroup.subtree_control > /dev/null 2>&1";
+            system(enable_intermediate.c_str());
+        }
 
         // Apply cgroup settings
         int success_count = 0;
