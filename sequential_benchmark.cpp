@@ -21,12 +21,14 @@ struct PhaseConfig {
     int iodepth;
     std::string pattern;
     std::string ioengine;
+    int rate_iops;        // Per-phase rate_iops (0 = unlimited)
 };
 
 struct WorkloadConfig {
     std::string description;
     std::string file_size;
     int numjobs;
+    int rate_iops;        // Workload-level rate_iops (0 = unlimited)
     // Legacy single-phase config (for backward compatibility)
     std::string block_size;
     int runtime;
@@ -186,8 +188,15 @@ private:
                     std::string phase_name = test_name + "_phase" + std::to_string(phase_idx + 1);
                     std::string phase_output = output_dir + "/" + phase_name + ".json";
 
-                    log("    Phase " + std::to_string(phase_idx + 1) + "/" + std::to_string(config.phases.size()) +
-                        ": " + phase.pattern + " for " + std::to_string(phase.runtime) + "s");
+                    // Use per-phase values with fallback to workload defaults
+                    int phase_rate_iops = (phase.rate_iops > 0) ? phase.rate_iops : config.rate_iops;
+
+                    std::string phase_info = "    Phase " + std::to_string(phase_idx + 1) + "/" + std::to_string(config.phases.size()) +
+                        ": " + phase.pattern + " for " + std::to_string(phase.runtime) + "s";
+                    if (phase_rate_iops > 0) {
+                        phase_info += " (rate_iops=" + std::to_string(phase_rate_iops) + ")";
+                    }
+                    log(phase_info);
 
                     // Build fio command for this phase
                     std::ostringstream fio_cmd;
@@ -204,6 +213,10 @@ private:
 
                     if (!phase.ioengine.empty()) {
                         fio_cmd << " --ioengine=" << phase.ioengine;
+                    }
+
+                    if (phase_rate_iops > 0) {
+                        fio_cmd << " --rate_iops=" << phase_rate_iops;
                     }
 
                     fio_cmd << " --group_reporting=1"
@@ -263,6 +276,10 @@ private:
 
                 if (!config.ioengine.empty()) {
                     fio_cmd << " --ioengine=" << config.ioengine;
+                }
+
+                if (config.rate_iops > 0) {
+                    fio_cmd << " --rate_iops=" << config.rate_iops;
                 }
 
                 fio_cmd << " --group_reporting=1"
@@ -404,7 +421,7 @@ private:
 
                         // Initialize phase if needed
                         if (phase_map.find(phase_num) == phase_map.end()) {
-                            phase_map[phase_num] = PhaseConfig{0, "", 0, "", ""};
+                            phase_map[phase_num] = PhaseConfig{0, "", 0, "", "", 0};
                         }
 
                         if (param == "runtime") phase_map[phase_num].runtime = std::stoi(value);
@@ -412,6 +429,7 @@ private:
                         else if (param == "iodepth") phase_map[phase_num].iodepth = std::stoi(value);
                         else if (param == "pattern") phase_map[phase_num].pattern = value;
                         else if (param == "ioengine") phase_map[phase_num].ioengine = value;
+                        else if (param == "rate_iops") phase_map[phase_num].rate_iops = std::stoi(value);
                     }
                 }
                 // Legacy single-phase parameters
@@ -423,6 +441,7 @@ private:
                 else if (key == "iodepth") current_workload.iodepth = std::stoi(value);
                 else if (key == "pattern") current_workload.pattern = value;
                 else if (key == "ioengine") current_workload.ioengine = value;
+                else if (key == "rate_iops") current_workload.rate_iops = std::stoi(value);
             }
         }
 
