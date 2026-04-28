@@ -6,7 +6,7 @@ This project investigates and addresses performance isolation failures in the Li
 
 ## Motivation and Context
 
-[Delta Fair Sharing](https://arxiv.org/abs/2601.20030) (ArXiv '26) solves performance isolation for RocksDB's *internal* resources (write buffer, read cache). For the **OS page cache**, the paper identifies interference as an open problem but does not provide a solution. That is the gap this project fills.
+[Delta Fair Sharing](https://arxiv.org/abs/2601.20030) (ArXiv '26) addresses performance isolation for RocksDB's *internal* resources (write buffer, read cache). For the **OS page cache**, the paper identifies interference as an open problem but does not provide a solution. That is the gap this project fills.
 
 **The interference mechanism** *(hypothesis we aim to validate experimentally)*: When tenant B exceeds its fair share of page cache, it evicts tenant A's pages from the LRU. A then reads up to its fair share, encounters cache misses, and issues disk reads. If B is also write-heavy, kswapd/the flusher concurrently drains B's dirty pages to disk. A's reads land in the I/O queue *behind* B's writeback flushes. A's effective read latency = writeback drain time + disk read time — far higher than a baseline disk read alone. The dirty writeback does not bypass cache eviction; it **amplifies the per-miss penalty** on top of it.
 
