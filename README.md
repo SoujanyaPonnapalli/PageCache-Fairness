@@ -1,35 +1,35 @@
 # Page Cache Fairness: Bounding p99 Latency Spikes in Multi-Tenant KV Stores
 
-This project investigates and addresses performance isolation failures in the Linux OS page cache for co-located multi-tenant key-value store workloads. We focus specifically on bounding p99 read latency spikes — a problem that existing OS mechanisms leave unsolved.
+This project investigates and addresses performance isolation failures in the Linux OS page cache for co-located multi-tenant key-value store workloads. We focus on bounding p99 read latency spikes — a problem that existing OS mechanisms leave unsolved.
 
 ---
 
-## Context and Motivation
+## Motivation and Context
 
-[Delta Fair Sharing](https://arxiv.org/abs/2601.20030) (SOSP '26) solves performance isolation for RocksDB's *internal* caches (write buffer, block cache) using a fairness-aware kernel module. For the **OS page cache**, the paper identifies interference as an open problem but does not provide a solution. That is the gap this project fills.
+[Delta Fair Sharing](https://arxiv.org/abs/2601.20030) (ArXiv '26) solves performance isolation for RocksDB's *internal* resources (write buffer, read cache). For the **OS page cache**, the paper identifies interference as an open problem but does not provide a solution. That is the gap this project fills.
 
-**The interference mechanism** *(hypothesis to be validated experimentally)*: When tenant B exceeds its fair share of page cache, it evicts tenant A's pages from the LRU. A then reads up to its fair share, encounters cache misses, and issues disk reads. If B is also write-heavy, kswapd/the flusher concurrently drains B's dirty pages to disk. A's reads land in the I/O queue *behind* B's writeback flushes. A's effective read latency = writeback drain time + disk read time — far higher than a baseline disk read alone. The dirty writeback does not bypass cache eviction; it **amplifies the per-miss penalty** on top of it.
+**The interference mechanism** *(hypothesis we aim to validated experimentally)*: When tenant B exceeds its fair share of page cache, it evicts tenant A's pages from the LRU. A then reads up to its fair share, encounters cache misses, and issues disk reads. If B is also write-heavy, kswapd/the flusher concurrently drains B's dirty pages to disk. A's reads land in the I/O queue *behind* B's writeback flushes. A's effective read latency = writeback drain time + disk read time — far higher than a baseline disk read alone. The dirty writeback does not bypass cache eviction; it **amplifies the per-miss penalty** on top of it.
 
-**Why existing approaches miss this**: cgroup memory limits and PSI-based tools (Senpai) act on total cached pages — they can reduce how much B evicts A, but even with perfect memory sizing, B's dirty page flushes still contend with A's reads at the I/O scheduler. PSI fires correctly for A's elevated stall but triggers the wrong remedy (memory limit adjustment) when the root cause is I/O queue contention from B's writeback.
+**Why existing approaches miss this interference**: cgroup memory limits and PSI-based tools (Senpai) act on total cached pages — they can reduce how much B evicts A, but even with perfect memory sizing, B's dirty page flushes still contend with A's reads at the I/O scheduler. PSI fires correctly for A's elevated stall but triggers the wrong remedy (memory limit adjustment) when the root cause is I/O queue contention from B's writeback.
 
 ---
 
 ## Reading List
 
-### Must-Read Papers
-| Paper | Why |
+### Research Papers
+| Paper | Key Contribution: Relevance |
 |---|---|
-| [Delta Fair Sharing](https://arxiv.org/abs/2601.20030) — SOSP '26 | Direct motivating paper; understand what they solve and what they leave open (OS page cache) |
-| [cache_ext: Customizing the Page Cache with eBPF](https://www.asafcidon.com/uploads/5/9/7/0/59701649/cache_ext.pdf) — SOSP '25 · [ACM](https://dl.acm.org/doi/10.1145/3731569.3764820) | Most relevant mechanism paper; eBPF hooks into eviction path; read codebase at [github.com/cache-ext/cache_ext](https://github.com/cache-ext/cache_ext) |
+| [Delta Fair Sharing](https://arxiv.org/abs/2601.20030) | Direct motivating paper; understand what they solve and what they leave open (OS page cache) |
+| [cache_ext: Customizing the Page Cache with eBPF](https://www.asafcidon.com/uploads/5/9/7/0/59701649/cache_ext.pdf) · [ACM](https://dl.acm.org/doi/10.1145/3731569.3764820)  — SOSP '25 | Most relevant mechanism paper; eBPF hooks into eviction path; · [Codebase](https://github.com/cache-ext/cache_ext) |
 | [RobinHood: Tail Latency Aware Caching](https://www.usenix.org/system/files/osdi18-berger.pdf) — OSDI '18 | Best prior art on p99-as-first-class-objective in caching; design pattern for latency-feedback-driven reallocation |
 | [NyxCache](https://research.cs.wisc.edu/adsl/Publications/fast22-kan.pdf) — FAST '22 | Multi-tenant PM caching with explicit QoS latency guarantees; 5× better isolation than bandwidth-limiting |
 | [StreamCache](https://www.usenix.org/system/files/atc24-li-zhiyue.pdf) — ATC '24 | Page cache for scan-heavy NVMe workloads; directly addresses scan-induced latency degradation |
 
 ### Background: Eviction Algorithms
-| Algorithm | Link | Why Relevant |
+| Algorithm | Link | Relevance |
 |---|---|---|
-| LIRS | [PDF](https://ranger.uta.edu/~sjiang/pubs/papers/jiang02_LIRS.pdf) | Scan-resistant; distinguishes hot vs. cold streams |
-| ARC | [USENIX](https://www.usenix.org/conference/fast-03/arc-self-tuning-low-overhead-replacement-cache) | Balances recency + frequency; used in ZFS |
+| LIRS | [SIGMETRICS'02](https://ranger.uta.edu/~sjiang/pubs/papers/jiang02_LIRS.pdf) | Scan-resistant; distinguishes hot vs. cold streams |
+| ARC | [FAST'03](https://www.usenix.org/conference/fast-03/arc-self-tuning-low-overhead-replacement-cache) | Balances recency + frequency; used in ZFS |
 | W-TinyLFU | [arXiv](https://arxiv.org/abs/1512.00727) | Frequency-aware; used in RocksDB's block cache |
 | CLOCK-Pro | [PDF](https://rcs.uwaterloo.ca/papers/clockpro.pdf) | Lightweight LIRS approximation |
 
@@ -204,7 +204,7 @@ Memory sizing tools (Senpai, cgroup limits) address only the first factor. They 
 
 ## Repository Status
 
-The benchmark infrastructure in this repo has the right skeleton. Here is where it currently stands against the experiment plan above.
+The benchmark infrastructure in this repo has the basic skeleton. Here is where it currently stands against the experiment plan above.
 
 ### What works
 - Dual-client concurrent execution (`fairness_benchmark.cpp`) — correct foundation
@@ -224,7 +224,7 @@ The benchmark infrastructure in this repo has the right skeleton. Here is where 
 | Fig 1 motivation cliff (sweep B intensity) | ❌ B's `rate_iops` is fixed; no intensity sweep |
 | Dirty writeback hypothesis | ❌ B never writes; `nr_dirty`/`nr_writeback` never instrumented |
 
-### What needs to change
+### TODO: First Steps
 
 1. **Add a B-writer config** in `fairness_configs.ini` with `pattern=write` or `randwrite`. Run A+B-reader vs. A+B-writer at the same eviction rate; if A's p99 is higher under B-writer, that validates the dirty writeback amplification claim.
 2. **Add an A-alone baseline run** (`client1_alone`, no B) and use that delta as the interference measurement.
@@ -261,6 +261,6 @@ See [`BENCHMARK.md`](BENCHMARK.md) for build and run instructions.
 
 ---
 
-## Contact
+## Contact Authors
 
 **Soujanya Ponnapalli** — soujanya@berkeley.edu
