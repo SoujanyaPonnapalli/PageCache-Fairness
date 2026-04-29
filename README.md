@@ -25,6 +25,13 @@ This project investigates and addresses performance isolation failures in the Li
 | [NyxCache](https://research.cs.wisc.edu/adsl/Publications/fast22-kan.pdf) — FAST '22 | Multi-tenant PM caching with explicit QoS latency guarantees; 5x better isolation than bandwidth-limiting |
 | [StreamCache](https://www.usenix.org/system/files/atc24-li-zhiyue.pdf) — ATC '24 | Page cache for scan-heavy NVMe workloads; directly addresses scan-induced latency degradation |
 
+### Fair Caching
+| Paper | Key Contribution: Relevance |
+|---|---|
+| [FairRide: Near-Optimal, Fair Cache Sharing](https://people.csail.mit.edu/matei/papers/2016/nsdi_fairride.pdf) — NSDI '16 | Most direct prior work on fair cache allocation across tenants; isolation + strategy-proofness via expected-delay mechanism; defines the fairness model this project must position against |
+| [Memshare: Dynamic Multi-tenant Key-value Cache](https://www.usenix.org/system/files/conference/atc17/atc17-cidon.pdf) — ATC '17 | Dynamic DRAM repartitioning across KV cache tenants; 39.7% miss reduction — same author as cache_ext (Asaf Cidon); see how fairness thinking evolved |
+| [Pisces: Performance Isolation for Multi-tenant Cloud Storage](https://www.usenix.org/system/files/conference/osdi12/osdi12-final-215.pdf) — OSDI '12 | Weighted fair queuing for shared KV storage at datacenter scale; shows what end-to-end isolation requires beyond cache sizing alone |
+
 ### Background: Eviction Algorithms
 | Algorithm | Link | Relevance |
 |---|---|---|
@@ -32,6 +39,7 @@ This project investigates and addresses performance isolation failures in the Li
 | ARC | [FAST'03](https://www.usenix.org/conference/fast-03/arc-self-tuning-low-overhead-replacement-cache) | Balances recency + frequency; used in ZFS |
 | W-TinyLFU | [arXiv](https://arxiv.org/abs/1512.00727) | Frequency-aware; used in RocksDB's block cache |
 | CLOCK-Pro | [PDF](https://rcs.uwaterloo.ca/papers/clockpro.pdf) | Lightweight LIRS approximation |
+| [Kernel Prefetching Impact on Buffer Cache Replacement](https://engineering.purdue.edu/~ychu/publications/sigm05_prefetch.pdf) — SIGMETRICS '05 | Shows kernel read-ahead changes the relative performance of replacement algorithms; relevant when reasoning about scan-induced eviction — prefetch amplifies scan footprint beyond explicit reads |
 
 ### Dynamic / Adaptive Memory Management
 | Resource | Why |
