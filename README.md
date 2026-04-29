@@ -29,7 +29,7 @@ This project investigates and addresses performance isolation failures in the Li
 | Paper | Key Contribution: Relevance |
 |---|---|
 | [FairRide: Near-Optimal, Fair Cache Sharing](https://people.csail.mit.edu/matei/papers/2016/nsdi_fairride.pdf) — NSDI '16 | Most direct prior work on fair cache allocation across tenants; isolation + strategy-proofness via expected-delay mechanism; defines the fairness model this project must position against |
-| [Memshare: Dynamic Multi-tenant Key-value Cache](https://www.usenix.org/system/files/conference/atc17/atc17-cidon.pdf) — ATC '17 | Dynamic DRAM repartitioning across KV cache tenants; 39.7% miss reduction — same author as cache_ext (Asaf Cidon); see how fairness thinking evolved |
+| [Memshare: Dynamic Multi-tenant Key-value Cache](https://www.usenix.org/system/files/conference/atc17/atc17-cidon.pdf) — ATC '17 | Dynamic DRAM repartitioning across KV cache tenants; 39.7% miss reduction — from the authors of cache_ext; see how fairness thinking evolved |
 | [Pisces: Performance Isolation for Multi-tenant Cloud Storage](https://www.usenix.org/system/files/conference/osdi12/osdi12-final-215.pdf) — OSDI '12 | Weighted fair queuing for shared KV storage at datacenter scale; shows what end-to-end isolation requires beyond cache sizing alone |
 
 ### Background: Eviction Algorithms
