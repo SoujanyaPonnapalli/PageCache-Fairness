@@ -250,27 +250,14 @@ Memory sizing tools (Senpai, cgroup limits) address only the first factor. They 
 
 ## Repository Status
 
-The benchmark infrastructure in this repo has the basic skeleton. See the TODO list below for what needs to change before experiments can produce the key results.
+The benchmark harness is the C suite in this repository (`benchmark.c`, workload and cgroup configs, and analysis scripts). Build and run instructions are in [`BENCHMARK.md`](BENCHMARK.md). How the harness is structured and how to run each case are in [`summary.md`](summary.md).
 
-### What works
-- Dual-client concurrent execution (`fairness_benchmark.cpp`) — correct foundation
-- Multi-phase workload with per-second fio logging (IOPS, p99, max latency)
-- fio JSON output captures `clat_ns.percentile.99` — the right metric
-- cgroup v2 integration (both shared and isolated config files present)
-- Direct I/O mode as a "no page cache" reference baseline
-- iostat monitoring alongside fio
-
-### TODO: First Steps
-
-1. **Add a B-writer config** in `fairness_configs.ini` with `pattern=write` or `randwrite`. Run A+B-reader vs. A+B-writer at the same eviction rate; if A's p99 is higher under B-writer, that validates the dirty writeback amplification claim.
-2. **Add an A-alone baseline run** (`client1_alone`, no B) and use that delta as the interference measurement.
-3. **Fix the cgroup v2 condition:** replace hard partition with `memory.low = working_set_size` (soft floor, no hard cap on B); sweep B intensity; show A's p99 still violates SLO.
-4. **Fix phase result merging** (line 578–597 of `fairness_benchmark.cpp`): currently copies only last phase's JSON; preserve all `_phase{N}.json` and plot as time series.
-5. **Add a sweep driver script:** run `dual` with varying `phase_1_rate_iops` for B to produce Fig 1.
-6. **Log dirty page metrics:** add `/proc/vmstat` (`nr_dirty`, `nr_writeback`) and per-cgroup `file_dirty` at 1-second intervals.
-7. **Change the fairness metric:** replace IOPS ratio with fraction of A's requests exceeding a latency SLO (e.g., 2x A's baseline p99).
-
-See [`BENCHMARK.md`](BENCHMARK.md) for build and run instructions.
+### What the harness measures
+- Dual-tenant runs: Tenant A (`client1_steady`, rate-limited `randread`) and Tenant B (`client2_noisy`). Either client can run alone as a baseline.
+- Mechanism 1 by default (B is a large clean sequential read). Switch `[client2_noisy]` to buffered `randwrite` for mechanism 2.
+- Shared pool (`cgroup_shared.ini`) and isolated cgroups (`cgroup_isolated.ini`, `memory.max` and `memory.min` set to 1G per tenant).
+- Per-phase fio latency (avg / p50 / p99 / p999), plus 1 Hz PSI, refaults, dirty pages, and `io.stat`.
+- Optional `--senpai`: the fairness fork sizes Tenant B's `memory.high` and Tenant A's `memory.low`. `--senpai-high` is upstream Senpai on Tenant B's `memory.high` only.
 
 ---
 
