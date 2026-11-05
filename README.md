@@ -257,6 +257,7 @@ The benchmark harness is the C suite in this repository (`benchmark.c`, workload
 - Mechanism 1 by default (B is a large clean sequential read). Switch `[client2_noisy]` to buffered `randwrite` for mechanism 2.
 - Shared pool (`cgroup_shared.ini`) and isolated cgroups (`cgroup_isolated.ini`, `memory.max` and `memory.min` set to 1G per tenant).
 - Per-phase fio latency (avg / p50 / p99 / p999), plus 1 Hz PSI, refaults, dirty pages, and `io.stat`.
+- Optional `--senpai-high`: upstream Senpai sizes Tenant B's `memory.high` only.
 
 ---
 

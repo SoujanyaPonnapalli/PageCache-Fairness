@@ -60,6 +60,7 @@ penalty beyond what memory sizing alone can fix — the core result.
 | `benchmark_analysis.py` | Reads a results dir and prints p99, refault deltas, per-phase memory/IO utilization, PSI stalls. |
 | `report_io_utilization.py` | Per-second join: p99, `io.stat` throughput, `io.pressure`, page-cache residency. |
 | `report_latency_timeseries.py` | Per-second join: Client1 p99 vs Client2 `memory.high`, labeled by phase. |
+| `senpai_high.py` | Optional. `--senpai-high` runs upstream Senpai on Client2 `memory.high`. |
 | `benchmark_results/` | Output (created on first run; `-o` overrides). |
 | `summary.md` | This document. |
 
@@ -168,6 +169,7 @@ benchmark_results/
 ├── memstat/<client>_<mode>.csv     # phase, when, refault/memory.current/pgfault/rios/file + deltas
 ├── clat/                           # fio write_hist_log 1 s histograms + generated .fio jobs
 ├── timeseries/                     # 1 Hz latency + cgroup/io.stat CSVs (see §14)
+├── senpai/senpai_<client>_<mode>.log  # only with --senpai-high
 └── dirty/
     ├── vmstat_<mode>.csv           # ts, nr_dirty, nr_writeback, pgpgin, pgscan_kswapd
     └── <cg>_<mode>_dirty.csv       # ts, file_dirty, file_writeback
@@ -367,6 +369,13 @@ read vs write B; plot B intensity (X) vs A p99 (Y).
       --clat-log           1 s fio clat histograms for client1+client2 (default on)
       --no-clat-log        Disable clat histogram logs (no per-second p99 series)
       --no-timeseries      Disable timeseries/ CSVs
+      --senpai-high        After phase 0, run senpai_high.py on Client2 memory.high
+      --senpai-script PATH Path to senpai_high.py  (default: ./senpai_high.py)
+      --senpai-client NAME Section to size         (default: client2_noisy)
+      --senpai-min-size N  memory.high floor       (default: 100M)
+      --senpai-max-size N  memory.high ceiling     (default: 2G)
+      --senpai-interval N  Probe interval seconds  (default: 6)
+      --senpai-pressure N  Stall budget in µs      (default: 10000)
   -m, --mode MODE          cached | direct | both  (default: both)
   -o, --output DIR         Results dir             (default: benchmark_results)
   -v, --verbose            Verbose logging (prints each fio command)
@@ -540,3 +549,16 @@ Disable recording if needed:
 - In the per-second table, watch for A's `c1_file_mib` falling while B's
   `c2_mibps` is high — that is eviction in progress, usually just before
   `c1_p99_us` degrades.
+
+### Upstream Senpai (`--senpai-high`)
+
+`--senpai-high` forks `senpai_high.py` after phase 0 and sizes only Client2's
+`memory.high` from memory PSI. It does not set Client1 `memory.low`. The
+process is stopped when the run finishes. Stdout is
+`senpai/senpai_<client>_<mode>.log`.
+
+```bash
+sudo ./benchmark -v --drop-once --senpai-high \
+  --cgroup-config cgroup_shared.ini \
+  -m cached -o results/senpai_high dual
+```

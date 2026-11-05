@@ -123,6 +123,13 @@ static struct {
     bool        drop_once;         /* drop page cache before phase 0 only, then let it persist */
     bool        write_clat_log;    /* fio write_lat_log for client1+client2 → 1 Hz p99 */
     bool        use_timeseries;    /* 1 Hz cgroup + clat logs */
+    bool        use_senpai_high;   /* fork senpai_high.py after phase 0 */
+    const char *senpai_script;     /* path to senpai_high.py */
+    const char *senpai_client;     /* cgroup whose memory.high Senpai sizes */
+    long        senpai_min_size;
+    long        senpai_max_size;
+    int         senpai_interval;
+    int         senpai_pressure;
 } opt = {
     .config_path        = "fairness_configs.ini",
     .cgroup_config_path = NULL,
@@ -135,6 +142,13 @@ static struct {
     .drop_once          = false,
     .write_clat_log     = true,
     .use_timeseries     = true,
+    .use_senpai_high    = false,
+    .senpai_script      = "./senpai_high.py",
+    .senpai_client      = "client2_noisy",
+    .senpai_min_size    = 100L << 20,
+    .senpai_max_size    = 2L << 30,
+    .senpai_interval    = 6,
+    .senpai_pressure    = 10000,
 };
 
 #define VLOG(...) do { if (opt.verbose) { fprintf(stderr, "[v] " __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
@@ -1332,6 +1346,73 @@ static void stop_clat_aggregator(pid_t pid) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Optional upstream Senpai (senpai_high.py): Client2 memory.high only.
+ * Started after phase 0 so Client1 warmup is undisturbed.
+ * ------------------------------------------------------------------ */
+
+static long parse_byte_size(const char *s) {
+    if (!s || !*s) return 0;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (!end || !*end) return v;
+    switch (*end) {
+    case 'k': case 'K': return v << 10;
+    case 'm': case 'M': return v << 20;
+    case 'g': case 'G': return v << 30;
+    default: return v;
+    }
+}
+
+static pid_t start_senpai_high(const char *cgroup_name, const char *mode) {
+    if (!is_linux() || !opt.use_senpai_high)
+        return -1;
+    if (!cgroup_name || !*cgroup_name) {
+        INFO("warning: --senpai-high needs --cgroup-config with [%s]", opt.senpai_client);
+        return -1;
+    }
+    if (access(opt.senpai_script, R_OK) != 0) {
+        INFO("warning: --senpai-high set but cannot read %s (%s)",
+             opt.senpai_script, strerror(errno));
+        return -1;
+    }
+
+    char log_dir[MAX_CMD], log_path[MAX_CMD], cg_path[MAX_CMD], cmd[MAX_CMD];
+    ensure_subdir(opt.output_dir, "senpai", log_dir, sizeof(log_dir));
+    snprintf(log_path, sizeof(log_path), "%s/senpai_%s_%s.log",
+             log_dir, opt.senpai_client, mode);
+    snprintf(cg_path, sizeof(cg_path), "%s/%s", CGROUP_ROOT, cgroup_name);
+
+    int n = snprintf(cmd, sizeof(cmd),
+             "exec python3 '%s' '%s' --min-size %ld --max-size %ld "
+             "--interval %d --pressure %d >> '%s' 2>&1",
+             opt.senpai_script, cg_path,
+             opt.senpai_min_size, opt.senpai_max_size,
+             opt.senpai_interval, opt.senpai_pressure, log_path);
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        INFO("warning: senpai-high command truncated");
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    if (pid < 0) {
+        INFO("warning: fork senpai-high: %s", strerror(errno));
+        return -1;
+    }
+    INFO("senpai-high armed after phase 0: memory.high %s -> %s", cg_path, log_path);
+    return pid;
+}
+
+static void stop_senpai_high(pid_t pid) {
+    if (pid <= 0) return;
+    kill(pid, SIGTERM);
+    waitpid(pid, NULL, 0);
+}
+
+/* ------------------------------------------------------------------ *
  * iostat -dx logger (device read/write latency + queue depth)
  * ------------------------------------------------------------------ */
 
@@ -1806,6 +1887,10 @@ static void run_clients(Config *cfg, const CgroupSet *cgset,
     pid_t clat_agg2 = client2_in_run
         ? start_clat_aggregator(mode_str, "client2_noisy") : -1;
 
+    const CgroupConfig *senpai_cg = cgset
+        ? cgroup_for_client(cgset, opt.senpai_client) : NULL;
+    pid_t senpai_pid = -1;
+
     /* run-start absolute refault per client; cgroups were just recreated so this
      * is ~0. Used to report cumulative "total refaults per phase" (not just the
      * per-phase delta). */
@@ -1885,8 +1970,13 @@ static void run_clients(Config *cfg, const CgroupSet *cgset,
                            tgt_file[i], prev_resident[i], NULL,
                            prev_nr_cache[i], NULL);
         }
+
+        if (ph == 0 && opt.use_senpai_high && senpai_pid < 0)
+            senpai_pid = start_senpai_high(
+                senpai_cg ? senpai_cg->cgroup_name : NULL, mode_str);
     }
 
+    stop_senpai_high(senpai_pid);
     stop_iostat(iostat);
     stop_clat_aggregator(clat_agg1);
     stop_clat_aggregator(clat_agg2);
@@ -1941,6 +2031,14 @@ static void usage(const char *argv0) {
 "      --clat-log           1 s fio clat histograms for client1+client2 (default on)\n"
 "      --no-clat-log        Disable clat histogram logging (no 1 Hz p99 series)\n"
 "      --no-timeseries      Disable 1 Hz timeseries/ CSVs\n"
+"      --senpai-high        After phase 0: senpai_high.py on Client2 memory.high\n"
+"                           (upstream Senpai; no Client1 memory.low)\n"
+"      --senpai-script PATH Path to senpai_high.py (default: ./senpai_high.py)\n"
+"      --senpai-client NAME Section whose memory.high is sized (default: client2_noisy)\n"
+"      --senpai-min-size N  memory.high floor (bytes / K/M/G; default 100M)\n"
+"      --senpai-max-size N  memory.high ceiling (default: 2G)\n"
+"      --senpai-interval N  Probe interval seconds (default: 6)\n"
+"      --senpai-pressure N  Memory-stall budget in µs (default: 10000)\n"
 "  -m, --mode MODE          cached | direct | both (default: both)\n"
 "  -o, --output DIR         Results directory (default: benchmark_results)\n"
 "  -v, --verbose            Verbose logging\n"
@@ -1956,7 +2054,9 @@ static void usage(const char *argv0) {
 "    The benchmark still runs if bpftrace is not installed.\n"
 "  * 1 Hz timeseries (default) land in <output>/timeseries/:\n"
 "      client1_steady_latency_<mode>.csv / client2_noisy_latency_<mode>.csv — p50–p99.9 + IOPS\n"
-"      client1_steady_<mode>.csv / client2_noisy_<mode>.csv — cgroup memory+PSI+io.stat (rios/wios/rbytes/wbytes)\n",
+"      client1_steady_<mode>.csv / client2_noisy_<mode>.csv — cgroup memory+PSI+io.stat (rios/wios/rbytes/wbytes)\n"
+"  * --senpai-high starts only after phase 0 and logs to\n"
+"      <output>/senpai/senpai_<client>_<mode>.log\n",
         argv0);
 }
 
@@ -1975,6 +2075,19 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--clat-log")) opt.write_clat_log = true;
         else if (!strcmp(a, "--no-clat-log")) opt.write_clat_log = false;
         else if (!strcmp(a, "--no-timeseries")) opt.use_timeseries = false;
+        else if (!strcmp(a, "--senpai-high")) opt.use_senpai_high = true;
+        else if (!strcmp(a, "--senpai-script") && i + 1 < argc)
+            opt.senpai_script = argv[++i];
+        else if (!strcmp(a, "--senpai-client") && i + 1 < argc)
+            opt.senpai_client = argv[++i];
+        else if (!strcmp(a, "--senpai-min-size") && i + 1 < argc)
+            opt.senpai_min_size = parse_byte_size(argv[++i]);
+        else if (!strcmp(a, "--senpai-max-size") && i + 1 < argc)
+            opt.senpai_max_size = parse_byte_size(argv[++i]);
+        else if (!strcmp(a, "--senpai-interval") && i + 1 < argc)
+            opt.senpai_interval = atoi(argv[++i]);
+        else if (!strcmp(a, "--senpai-pressure") && i + 1 < argc)
+            opt.senpai_pressure = atoi(argv[++i]);
         else if ((!strcmp(a, "-c") || !strcmp(a, "--config")) && i + 1 < argc) opt.config_path = argv[++i];
         else if (!strcmp(a, "--cgroup-config") && i + 1 < argc) opt.cgroup_config_path = argv[++i];
         else if ((!strcmp(a, "-o") || !strcmp(a, "--output")) && i + 1 < argc) opt.output_dir = argv[++i];
