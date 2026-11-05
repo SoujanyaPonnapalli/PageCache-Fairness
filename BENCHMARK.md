@@ -48,13 +48,14 @@ writeback amplifies the miss penalty beyond what memory sizing alone can fix.
 ├── benchmark_analysis.py          # Results analysis (fio + PSI + refaults)
 ├── report_latency_timeseries.py   # Per-second c1 p99 vs c2 memory.high
 ├── report_io_utilization.py       # Per-second p99 / io.stat / PSI / throughput CSV
+├── senpai.py                      # --senpai: memory.high + victim memory.low
 ├── senpai_high.py                 # --senpai-high: upstream Senpai, memory.high only
 ├── summary.md                     # How the harness runs
 ├── results/                       # Per-run output (`-o` overrides; gitignored)
 │   ├── *.json                     # Raw fio output (per client per phase)
 │   ├── clat/                      # 1 s fio clat histograms (client1+2, default on)
 │   ├── timeseries/                # 1 Hz latency + cgroup CSVs
-│   ├── senpai/                    # senpai_high.py stdout when --senpai-high is used
+│   ├── senpai/                    # Senpai stdout when --senpai or --senpai-high is used
 │   ├── iostat/                    # iostat -dx logs
 │   ├── psi/                       # Per-cgroup PSI time series (CSV)
 │   ├── psi_entries/               # bpftrace entry-count CSVs (default on)
@@ -248,15 +249,19 @@ The harness records **1 Hz timeseries** by default (Linux + cgroups): per-tenant
 latency percentiles and cgroup memory, PSI, and `io.stat`. The file layout is in
 **[summary.md — 1 Hz timeseries](summary.md#14-1-hz-timeseries)**.
 
-## Upstream Senpai
+## Senpai
 
-`--senpai-high` starts [upstream Senpai](https://github.com/facebookincubator/senpai) (`senpai_high.py`) after phase 0. It adjusts only Tenant B's `memory.high` from memory PSI. It does not move Tenant A's `memory.low`.
+Both modes start after phase 0 and require `--cgroup-config`. Pass only one of them.
+
+- `--senpai` runs `senpai.py`: Tenant B's `memory.high` from PSI, and Tenant A's `memory.low` from live p99 and cache retention.
+- `--senpai-high` runs `senpai_high.py`: [upstream Senpai](https://github.com/facebookincubator/senpai) on Tenant B's `memory.high` only.
 
 ```bash
+sudo ./benchmark -v --drop-once --senpai --cgroup-config cgroup_shared.ini -m cached -o results/senpai dual
 sudo ./benchmark -v --drop-once --senpai-high --cgroup-config cgroup_shared.ini -m cached -o results/senpai_high dual
 ```
 
-Stdout goes to `results/senpai_high/senpai/senpai_client2_noisy_cached.log`. Client2's 1 Hz timeseries still samples `memory.high`. `--senpai-high` requires `--cgroup-config`.
+Stdout goes to `<output>/senpai/senpai_client2_noisy_cached.log`. `--senpai` also writes `<output>/senpai/controller_cached.csv`. Client2's 1 Hz timeseries still samples `memory.high`. `--senpai` also takes `--senpai-victim`, `--senpai-p99-target`, `--senpai-low-min`, and `--senpai-low-max`.
 
 ## 📈 Understanding Results
 
@@ -528,13 +533,17 @@ phase_0_ioengine = libaio
 ```bash
 sudo ./benchmark --help
 sudo ./benchmark -v --drop-once --cgroup-config cgroup_shared.ini -m cached -o results/cached_dual dual
+sudo ./benchmark -v --drop-once --senpai --cgroup-config cgroup_shared.ini -m cached -o results/senpai dual
 sudo ./benchmark -v --drop-once --senpai-high --cgroup-config cgroup_shared.ini -m cached -o results/senpai_high dual
 sudo ./benchmark -c fairness_configs.ini -o results/ client1_steady
 ```
 
-`--senpai-high` runs `senpai_high.py` on Client2 `memory.high` only. Knobs:
+`--senpai` runs `senpai.py` (Client2 `memory.high` and Client1 `memory.low`).
+`--senpai-high` runs `senpai_high.py` (Client2 `memory.high` only). Shared knobs:
 `--senpai-script`, `--senpai-client`, `--senpai-min-size`, `--senpai-max-size`,
-`--senpai-interval`, `--senpai-pressure`. Timeseries: `--no-timeseries`,
+`--senpai-interval`, `--senpai-pressure`. `--senpai` also takes `--senpai-victim`,
+`--senpai-p99-target`, `--senpai-low-min`, and `--senpai-low-max`. Timeseries:
+`--no-timeseries`,
 `--no-clat-log` (`--clat-log` writes 1 s histograms, not per-IO samples). See
 [summary.md — 1 Hz timeseries](summary.md#14-1-hz-timeseries).
 
@@ -559,7 +568,7 @@ The harness is **implemented and runnable on Linux (cgroup v2)**.
 
 ### Harness
 
-- **CLI:** `--config`, `--cgroup-config`, `-o`, `-m cached|direct|both`, `--no-cgroup`, `--no-psi`, `--no-bpftrace`, `--drop-once`, `--senpai-high`, `--no-timeseries`, `--no-clat-log`, `-v`
+- **CLI:** `--config`, `--cgroup-config`, `-o`, `-m cached|direct|both`, `--no-cgroup`, `--no-psi`, `--no-bpftrace`, `--drop-once`, `--senpai`, `--senpai-high`, `--no-timeseries`, `--no-clat-log`, `-v`
 - **Modes:** `dual` (`client1_steady` + `client2_noisy`), single section name, `all`
 - **Cache:** `drop_caches()` before every cached phase by default; `--drop-once` drops only before phase 0. Cached mode also passes `--invalidate=0` so fio does not discard the warm set at job start.
 - **Test files:** `test_file_<client>_<file_size>` created lazily by the harness
@@ -583,7 +592,7 @@ The harness is **implemented and runnable on Linux (cgroup v2)**.
 - **timeseries (default):** `timeseries/` — client1/client2 latency percentiles + cgroup
   memory/PSI/io.stat (client2 includes a 1 Hz `memory.high` sample)
 - **clat (default for client1+client2):** `clat/` — fio `write_hist_log` (`log_hist_msec=1000`) for 1 Hz p99 aggregation
-- **senpai-high (optional):** `--senpai-high` runs `senpai_high.py` → `senpai/senpai_<client>_<mode>.log`
+- **senpai (optional):** `--senpai` (`senpai.py`) or `--senpai-high` (`senpai_high.py`) → `senpai/senpai_<client>_<mode>.log`
 
 Requires `--cgroup-config` for per-tenant memstat/PSI/dirty.
 

@@ -124,12 +124,18 @@ static struct {
     bool        write_clat_log;    /* fio write_lat_log for client1+client2 → 1 Hz p99 */
     bool        use_timeseries;    /* 1 Hz cgroup + clat logs */
     bool        use_senpai_high;   /* fork senpai_high.py after phase 0 */
-    const char *senpai_script;     /* path to senpai_high.py */
-    const char *senpai_client;     /* cgroup whose memory.high Senpai sizes */
+    bool        use_senpai;        /* fork senpai.py (memory.high + victim memory.low) */
+    bool        senpai_script_set; /* user passed --senpai-script */
+    const char *senpai_script;     /* senpai_high.py or senpai.py */
+    const char *senpai_client;     /* Client2: memory.high from PSI */
+    const char *senpai_victim;     /* Client1: memory.low from p99 (senpai.py only) */
     long        senpai_min_size;
     long        senpai_max_size;
     int         senpai_interval;
     int         senpai_pressure;
+    double      senpai_p99_target;   /* Client1 p99 SLO in µs */
+    long        senpai_low_min_size;
+    long        senpai_low_max_size;
 } opt = {
     .config_path        = "fairness_configs.ini",
     .cgroup_config_path = NULL,
@@ -143,12 +149,18 @@ static struct {
     .write_clat_log     = true,
     .use_timeseries     = true,
     .use_senpai_high    = false,
+    .use_senpai         = false,
+    .senpai_script_set  = false,
     .senpai_script      = "./senpai_high.py",
     .senpai_client      = "client2_noisy",
+    .senpai_victim      = "client1_steady",
     .senpai_min_size    = 100L << 20,
     .senpai_max_size    = 2L << 30,
     .senpai_interval    = 6,
     .senpai_pressure    = 10000,
+    .senpai_p99_target  = 3.0,
+    .senpai_low_min_size = 0,
+    .senpai_low_max_size = 2L << 30,
 };
 
 #define VLOG(...) do { if (opt.verbose) { fprintf(stderr, "[v] " __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
@@ -1412,6 +1424,94 @@ static void stop_senpai_high(pid_t pid) {
     waitpid(pid, NULL, 0);
 }
 
+/* must match senpai.py --parent-util-threshold default */
+#define SENPAI_PARENT_UTIL_THRESHOLD 0.90
+
+/* senpai.py: Client2 memory.high from PSI, Client1 memory.low from live p99. */
+static pid_t start_senpai(const char *c2_cgroup_name,
+                          const char *c1_cgroup_name,
+                          const char *c2_target_file,
+                          const char *c1_target_file,
+                          const char *mode) {
+    if (!is_linux() || !opt.use_senpai)
+        return -1;
+    if (!c2_cgroup_name || !*c2_cgroup_name) {
+        INFO("warning: --senpai needs --cgroup-config with [%s]", opt.senpai_client);
+        return -1;
+    }
+    if (access(opt.senpai_script, R_OK) != 0) {
+        INFO("warning: --senpai set but cannot read %s (%s)",
+             opt.senpai_script, strerror(errno));
+        return -1;
+    }
+    if (!c1_cgroup_name || !*c1_cgroup_name ||
+        !c1_target_file || !*c1_target_file ||
+        !c2_target_file || !*c2_target_file) {
+        INFO("warning: --senpai needs target files and cgroups for [%s] and [%s]",
+             opt.senpai_victim, opt.senpai_client);
+        return -1;
+    }
+    if (!opt.use_timeseries)
+        INFO("warning: --no-timeseries disables the nr_cache feeds senpai.py needs");
+
+    char log_dir[MAX_CMD], log_path[MAX_CMD], cg_path[MAX_CMD], cmd[MAX_CMD];
+    char victim_path[MAX_CMD], parent_path[MAX_CMD];
+    char p99_live[MAX_CMD], c1_cache_live[MAX_CMD], c2_cache_live[MAX_CMD];
+    char ts_dir[MAX_CMD], controller_csv[MAX_CMD];
+    ensure_subdir(opt.output_dir, "senpai", log_dir, sizeof(log_dir));
+    snprintf(log_path, sizeof(log_path), "%s/senpai_%s_%s.log",
+             log_dir, opt.senpai_client, mode);
+    snprintf(controller_csv, sizeof(controller_csv), "%s/controller_%s.csv",
+             log_dir, mode);
+    snprintf(cg_path, sizeof(cg_path), "%s/%s", CGROUP_ROOT, c2_cgroup_name);
+    snprintf(victim_path, sizeof(victim_path), "%s/%s", CGROUP_ROOT, c1_cgroup_name);
+    snprintf(parent_path, sizeof(parent_path), "%s", victim_path);
+    char *slash = strrchr(parent_path, '/');
+    if (slash && slash != parent_path) *slash = '\0';
+    else parent_path[0] = '\0';
+    snprintf(ts_dir, sizeof(ts_dir), "%s/timeseries", opt.output_dir);
+    snprintf(p99_live, sizeof(p99_live), "%s/%s_p99.live", ts_dir, opt.senpai_victim);
+    live_nr_cache_path(c1_cache_live, sizeof(c1_cache_live), ts_dir, opt.senpai_victim);
+    live_nr_cache_path(c2_cache_live, sizeof(c2_cache_live), ts_dir, opt.senpai_client);
+
+    int n = snprintf(cmd, sizeof(cmd),
+             "exec python3 '%s' '%s' --min-size %ld --max-size %ld "
+             "--interval %d --pressure %d"
+             " --victim-cgpath '%s' --victim-p99 '%s'"
+             " --victim-nr-cache '%s' --noisy-nr-cache '%s'"
+             " --victim-file '%s' --noisy-file '%s'"
+             " --parent-cgpath '%s' --parent-util-threshold %.3f"
+             " --p99-target %.3f --low-min-size %ld --low-max-size %ld"
+             " --controller-csv '%s' >> '%s' 2>&1",
+             opt.senpai_script, cg_path,
+             opt.senpai_min_size, opt.senpai_max_size,
+             opt.senpai_interval, opt.senpai_pressure,
+             victim_path, p99_live, c1_cache_live, c2_cache_live,
+             c1_target_file, c2_target_file,
+             parent_path[0] ? parent_path : "",
+             SENPAI_PARENT_UTIL_THRESHOLD,
+             opt.senpai_p99_target,
+             opt.senpai_low_min_size, opt.senpai_low_max_size,
+             controller_csv, log_path);
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        INFO("warning: senpai command truncated");
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    if (pid < 0) {
+        INFO("warning: fork senpai: %s", strerror(errno));
+        return -1;
+    }
+    INFO("senpai armed after phase 0: Client2 high=%s Client1 low=%s -> %s",
+         cg_path, victim_path, log_path);
+    return pid;
+}
+
 /* ------------------------------------------------------------------ *
  * iostat -dx logger (device read/write latency + queue depth)
  * ------------------------------------------------------------------ */
@@ -1889,6 +1989,8 @@ static void run_clients(Config *cfg, const CgroupSet *cgset,
 
     const CgroupConfig *senpai_cg = cgset
         ? cgroup_for_client(cgset, opt.senpai_client) : NULL;
+    const CgroupConfig *senpai_victim_cg = cgset
+        ? cgroup_for_client(cgset, opt.senpai_victim) : NULL;
     pid_t senpai_pid = -1;
 
     /* run-start absolute refault per client; cgroups were just recreated so this
@@ -1971,9 +2073,22 @@ static void run_clients(Config *cfg, const CgroupSet *cgset,
                            prev_nr_cache[i], NULL);
         }
 
-        if (ph == 0 && opt.use_senpai_high && senpai_pid < 0)
-            senpai_pid = start_senpai_high(
-                senpai_cg ? senpai_cg->cgroup_name : NULL, mode_str);
+        if (ph == 0 && senpai_pid < 0 && (opt.use_senpai || opt.use_senpai_high)) {
+            if (opt.use_senpai) {
+                char c2_file[MAX_STR] = "", c1_file[MAX_STR] = "";
+                ClientConfig *c2cfg = find_client(cfg, opt.senpai_client);
+                ClientConfig *c1cfg = find_client(cfg, opt.senpai_victim);
+                if (c2cfg) test_file_for(c2cfg, c2_file, sizeof(c2_file));
+                if (c1cfg) test_file_for(c1cfg, c1_file, sizeof(c1_file));
+                senpai_pid = start_senpai(
+                    senpai_cg ? senpai_cg->cgroup_name : NULL,
+                    senpai_victim_cg ? senpai_victim_cg->cgroup_name : NULL,
+                    c2_file, c1_file, mode_str);
+            } else {
+                senpai_pid = start_senpai_high(
+                    senpai_cg ? senpai_cg->cgroup_name : NULL, mode_str);
+            }
+        }
     }
 
     stop_senpai_high(senpai_pid);
@@ -2031,14 +2146,21 @@ static void usage(const char *argv0) {
 "      --clat-log           1 s fio clat histograms for client1+client2 (default on)\n"
 "      --no-clat-log        Disable clat histogram logging (no 1 Hz p99 series)\n"
 "      --no-timeseries      Disable 1 Hz timeseries/ CSVs\n"
+"      --senpai             After phase 0: senpai.py on Client2 memory.high (PSI)\n"
+"                           + Client1 memory.low (p99; default target 3 us)\n"
 "      --senpai-high        After phase 0: senpai_high.py on Client2 memory.high\n"
 "                           (upstream Senpai; no Client1 memory.low)\n"
-"      --senpai-script PATH Path to senpai_high.py (default: ./senpai_high.py)\n"
-"      --senpai-client NAME Section whose memory.high is sized (default: client2_noisy)\n"
+"      --senpai-script PATH Senpai script (default: ./senpai.py with --senpai,\n"
+"                           ./senpai_high.py with --senpai-high)\n"
+"      --senpai-client NAME Client2 section for memory.high (default: client2_noisy)\n"
+"      --senpai-victim NAME Client1 section for memory.low (default: client1_steady)\n"
 "      --senpai-min-size N  memory.high floor (bytes / K/M/G; default 100M)\n"
 "      --senpai-max-size N  memory.high ceiling (default: 2G)\n"
 "      --senpai-interval N  Probe interval seconds (default: 6)\n"
 "      --senpai-pressure N  Memory-stall budget in µs (default: 10000)\n"
+"      --senpai-p99-target N  Client1 p99 SLO in µs (default: 3.0)\n"
+"      --senpai-low-min N   Client1 memory.low floor (bytes / K/M/G)\n"
+"      --senpai-low-max N   Client1 memory.low ceiling (default: 2G)\n"
 "  -m, --mode MODE          cached | direct | both (default: both)\n"
 "  -o, --output DIR         Results directory (default: benchmark_results)\n"
 "  -v, --verbose            Verbose logging\n"
@@ -2055,8 +2177,10 @@ static void usage(const char *argv0) {
 "  * 1 Hz timeseries (default) land in <output>/timeseries/:\n"
 "      client1_steady_latency_<mode>.csv / client2_noisy_latency_<mode>.csv — p50–p99.9 + IOPS\n"
 "      client1_steady_<mode>.csv / client2_noisy_<mode>.csv — cgroup memory+PSI+io.stat (rios/wios/rbytes/wbytes)\n"
-"  * --senpai-high starts only after phase 0 and logs to\n"
-"      <output>/senpai/senpai_<client>_<mode>.log\n",
+"  * --senpai and --senpai-high start only after phase 0 and log to\n"
+"      <output>/senpai/senpai_<client>_<mode>.log\n"
+"    --senpai also writes <output>/senpai/controller_<mode>.csv.\n"
+"    Pass only one of --senpai and --senpai-high.\n",
         argv0);
 }
 
@@ -2075,11 +2199,16 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--clat-log")) opt.write_clat_log = true;
         else if (!strcmp(a, "--no-clat-log")) opt.write_clat_log = false;
         else if (!strcmp(a, "--no-timeseries")) opt.use_timeseries = false;
+        else if (!strcmp(a, "--senpai")) opt.use_senpai = true;
         else if (!strcmp(a, "--senpai-high")) opt.use_senpai_high = true;
-        else if (!strcmp(a, "--senpai-script") && i + 1 < argc)
+        else if (!strcmp(a, "--senpai-script") && i + 1 < argc) {
             opt.senpai_script = argv[++i];
+            opt.senpai_script_set = true;
+        }
         else if (!strcmp(a, "--senpai-client") && i + 1 < argc)
             opt.senpai_client = argv[++i];
+        else if (!strcmp(a, "--senpai-victim") && i + 1 < argc)
+            opt.senpai_victim = argv[++i];
         else if (!strcmp(a, "--senpai-min-size") && i + 1 < argc)
             opt.senpai_min_size = parse_byte_size(argv[++i]);
         else if (!strcmp(a, "--senpai-max-size") && i + 1 < argc)
@@ -2088,6 +2217,12 @@ int main(int argc, char **argv) {
             opt.senpai_interval = atoi(argv[++i]);
         else if (!strcmp(a, "--senpai-pressure") && i + 1 < argc)
             opt.senpai_pressure = atoi(argv[++i]);
+        else if (!strcmp(a, "--senpai-p99-target") && i + 1 < argc)
+            opt.senpai_p99_target = atof(argv[++i]);
+        else if (!strcmp(a, "--senpai-low-min") && i + 1 < argc)
+            opt.senpai_low_min_size = parse_byte_size(argv[++i]);
+        else if (!strcmp(a, "--senpai-low-max") && i + 1 < argc)
+            opt.senpai_low_max_size = parse_byte_size(argv[++i]);
         else if ((!strcmp(a, "-c") || !strcmp(a, "--config")) && i + 1 < argc) opt.config_path = argv[++i];
         else if (!strcmp(a, "--cgroup-config") && i + 1 < argc) opt.cgroup_config_path = argv[++i];
         else if ((!strcmp(a, "-o") || !strcmp(a, "--output")) && i + 1 < argc) opt.output_dir = argv[++i];
@@ -2101,6 +2236,13 @@ int main(int argc, char **argv) {
         else if (a[0] == '-') { INFO("error: unknown option '%s'", a); usage(argv[0]); return 2; }
         else workload = a;
     }
+
+    if (opt.use_senpai && opt.use_senpai_high) {
+        INFO("error: pass only one of --senpai and --senpai-high");
+        return 2;
+    }
+    if (opt.use_senpai && !opt.senpai_script_set)
+        opt.senpai_script = "./senpai.py";
 
     if (!workload) { usage(argv[0]); return 2; }
 

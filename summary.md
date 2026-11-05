@@ -60,6 +60,7 @@ penalty beyond what memory sizing alone can fix — the core result.
 | `benchmark_analysis.py` | Reads a results dir and prints p99, refault deltas, per-phase memory/IO utilization, PSI stalls. |
 | `report_io_utilization.py` | Per-second join: p99, `io.stat` throughput, `io.pressure`, page-cache residency. |
 | `report_latency_timeseries.py` | Per-second join: Client1 p99 vs Client2 `memory.high`, labeled by phase. |
+| `senpai.py` | Optional. `--senpai` sizes Client2 `memory.high` and Client1 `memory.low`. |
 | `senpai_high.py` | Optional. `--senpai-high` runs upstream Senpai on Client2 `memory.high`. |
 | `benchmark_results/` | Output (created on first run; `-o` overrides). |
 | `summary.md` | This document. |
@@ -169,7 +170,7 @@ benchmark_results/
 ├── memstat/<client>_<mode>.csv     # phase, when, refault/memory.current/pgfault/rios/file + deltas
 ├── clat/                           # fio write_hist_log 1 s histograms + generated .fio jobs
 ├── timeseries/                     # 1 Hz latency + cgroup/io.stat CSVs (see §14)
-├── senpai/senpai_<client>_<mode>.log  # only with --senpai-high
+├── senpai/senpai_<client>_<mode>.log  # --senpai or --senpai-high
 └── dirty/
     ├── vmstat_<mode>.csv           # ts, nr_dirty, nr_writeback, pgpgin, pgscan_kswapd
     └── <cg>_<mode>_dirty.csv       # ts, file_dirty, file_writeback
@@ -369,9 +370,14 @@ read vs write B; plot B intensity (X) vs A p99 (Y).
       --clat-log           1 s fio clat histograms for client1+client2 (default on)
       --no-clat-log        Disable clat histogram logs (no per-second p99 series)
       --no-timeseries      Disable timeseries/ CSVs
+      --senpai             After phase 0, run senpai.py (memory.high + victim memory.low)
       --senpai-high        After phase 0, run senpai_high.py on Client2 memory.high
-      --senpai-script PATH Path to senpai_high.py  (default: ./senpai_high.py)
-      --senpai-client NAME Section to size         (default: client2_noisy)
+      --senpai-script PATH Script path             (default: ./senpai.py or ./senpai_high.py)
+      --senpai-client NAME Client2 section         (default: client2_noisy)
+      --senpai-victim NAME Client1 section         (default: client1_steady; --senpai only)
+      --senpai-p99-target N  Client1 p99 SLO in µs (default: 3.0; --senpai only)
+      --senpai-low-min N   Client1 memory.low floor (--senpai only)
+      --senpai-low-max N   Client1 memory.low ceiling (default: 2G; --senpai only)
       --senpai-min-size N  memory.high floor       (default: 100M)
       --senpai-max-size N  memory.high ceiling     (default: 2G)
       --senpai-interval N  Probe interval seconds  (default: 6)
@@ -549,6 +555,20 @@ Disable recording if needed:
 - In the per-second table, watch for A's `c1_file_mib` falling while B's
   `c2_mibps` is high — that is eviction in progress, usually just before
   `c1_p99_us` degrades.
+
+### Fairness Senpai (`--senpai`)
+
+`--senpai` forks `senpai.py` after phase 0. Client2 `memory.high` still follows
+PSI, and upward moves are suppressed while Client2 is displacing Client1.
+Client1 `memory.low` moves from the shared parent's fullness, live cache
+retention, and Client1 p99. Stdout is `senpai/senpai_<client>_<mode>.log`;
+per-tick decisions are `senpai/controller_<mode>.csv`.
+
+```bash
+sudo ./benchmark -v --drop-once --senpai \
+  --cgroup-config cgroup_shared.ini \
+  -m cached -o results/senpai dual
+```
 
 ### Upstream Senpai (`--senpai-high`)
 
