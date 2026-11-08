@@ -1,32 +1,37 @@
-# C++ build artifacts
-fairness_benchmark
-sequential_benchmark
+# Build artifacts
+benchmark
 *.o
 *.exe
 
-# IDE files
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+cmake-build-*/
+CMakeLists.txt
 
 # macOS
 .DS_Store
 
-# Test files (large)
+# Generated test files (can be tens of GB)
 test_file_*
 
-# Results and logs
+# Results
+benchmark_results/
+results/
 fairness_results/
 test_results/
 *.log
-*.csv
 *.iostat
+
+# Python
+__pycache__/
+*.pyc
 
 # Temporary files
 *.tmp
 *.temp
-/tmp/
 
 # Backup files
 *~
