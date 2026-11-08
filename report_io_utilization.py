@@ -211,6 +211,122 @@ def print_column_legend(has_rbytes):
         print(line)
 
 
+def latency_clients(ts_dir, mode):
+    suffix = f"_latency_{mode}.csv"
+    names = []
+    for path in sorted(glob(os.path.join(ts_dir, "*" + suffix))):
+        base = os.path.basename(path)
+        if base.startswith("per_second"):
+            continue
+        names.append(base[:-len(suffix)])
+    return names
+
+
+def infer_mode(ts_dir):
+    modes = []
+    for path in sorted(glob(os.path.join(ts_dir, "*_latency_*.csv"))):
+        base = os.path.basename(path)
+        if base.startswith("per_second"):
+            continue
+        mark = base.rfind("_latency_")
+        if mark < 0:
+            continue
+        mode = base[mark + len("_latency_"):-4]
+        if mode not in modes:
+            modes.append(mode)
+    if "cached" in modes:
+        return "cached"
+    return modes[0] if modes else None
+
+
+def report_multi(results_dir, ts_dir, mode, user_path, no_write):
+    """One row per client per second when the run is not the two-tenant pair."""
+    names = latency_clients(ts_dir, mode)
+    if not names:
+        print(f"error: no *_latency_{mode}.csv under {ts_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    per = {}
+    for name in names:
+        lat = os.path.join(ts_dir, f"{name}_latency_{mode}.csv")
+        cg = os.path.join(ts_dir, f"{name}_{mode}.csv")
+        if not os.path.isfile(cg):
+            print(f"error: missing {cg}", file=sys.stderr)
+            sys.exit(1)
+        rows = load_csv(cg)
+        if rows and "rios" not in rows[0]:
+            print(f"error: no rios in {cg}", file=sys.stderr)
+            sys.exit(1)
+        p99 = {int(r["wall_time"]): float(r["p99_us"]) for r in load_csv(lat)}
+        per[name] = {
+            "p99": p99,
+            "rbytes": cumulative_deltas(rows, "rbytes") if rows and "rbytes" in rows[0] else {},
+            "rios": cumulative_deltas(rows, "rios"),
+            "io": cumulative_deltas(rows, "io_psi_some_total_us"),
+            "file": levels(rows, "file_bytes"),
+            "target": levels(rows, "target_file_resident_bytes")
+                      if rows and "target_file_resident_bytes" in rows[0] else {},
+            "nr_cache": levels(rows, "target_file_nr_cache_bytes")
+                        if rows and "target_file_nr_cache_bytes" in rows[0] else {},
+        }
+
+    memstat = os.path.join(results_dir, "memstat", f"{names[0]}_{mode}.csv")
+    windows = phase_windows(memstat) if os.path.isfile(memstat) else {}
+    keys = sorted(set().union(*(p["rios"] for p in per.values())))
+
+    rows_out = []
+    for t in keys:
+        phase = label_phase(t, windows) if windows else "gap"
+        for name in names:
+            p = per[name]
+            rows_out.append({
+                "wall_time": t,
+                "phase": phase,
+                "client": name,
+                "p99_us": p["p99"].get(t),
+                "mibps": read_mibps(t, p["rbytes"], p["rios"], bool(p["rbytes"])),
+                "rios": p["rios"].get(t),
+                "file_mib": to_mib(p["file"].get(t)),
+                "target_mib": to_mib(p["target"].get(t)),
+                "nr_cache_mib": to_mib(p["nr_cache"].get(t)),
+                "io_us": p["io"].get(t),
+            })
+
+    out_path = None
+    if not no_write:
+        dest = user_path or os.path.join(ts_dir, "per_second_io_utilization.csv")
+        try:
+            with open(dest, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["wall_time", "phase", "client", "p99_us", "mibps",
+                            "rios", "file_mib", "target_mib", "nr_cache_mib", "io_us"])
+                for row in rows_out:
+                    w.writerow([
+                        row["wall_time"], row["phase"], row["client"],
+                        csv_cell(row["p99_us"], 1), csv_cell(row["mibps"], 1),
+                        csv_cell(row["rios"]), csv_cell(row["file_mib"], 1),
+                        csv_cell(row["target_mib"], 1), csv_cell(row["nr_cache_mib"], 1),
+                        csv_cell(row["io_us"]),
+                    ])
+            out_path = dest
+        except OSError as e:
+            print(f"warning: could not write {dest}: {e}", file=sys.stderr)
+
+    print(f"# PER-SECOND IO UTILIZATION — {results_dir}")
+    print(f"# clients: {', '.join(names)}")
+    if out_path:
+        print(f"# wrote {out_path} ({len(rows_out)} rows)")
+    print()
+    print(f"{'wall_time':>12} {'phase':>10} {'client':<16} {'p99':>10} "
+          f"{'MiB/s':>8} {'rios':>8} {'file':>8} {'tgt':>8} {'nr_cache':>8} {'io_us':>10}")
+    for row in rows_out:
+        print(f"{row['wall_time']:12d} {row['phase']:>10} {row['client']:<16} "
+              f"{fmt(row['p99_us'], 10, 1)} {fmt(row['mibps'], 8, 1)} "
+              f"{fmt(row['rios'], 8)} {fmt(row['file_mib'], 8, 1)} "
+              f"{fmt(row['target_mib'], 8, 1)} {fmt(row['nr_cache_mib'], 8, 1)} "
+              f"{fmt(row['io_us'], 10)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -241,9 +357,12 @@ def main():
                 if "latency" not in os.path.basename(p)
                 and not os.path.basename(p).startswith("per_second")]
     if not lat1_paths or not c1_paths:
-        print("error: need client1_steady_latency_*.csv and client1_steady_*.csv",
-              file=sys.stderr)
-        sys.exit(1)
+        mode = args.mode or infer_mode(ts_dir)
+        if not mode:
+            print("error: no *_latency_*.csv", file=sys.stderr)
+            sys.exit(1)
+        report_multi(results_dir, ts_dir, mode, args.output, args.no_write)
+        return
 
     mode = args.mode or ts_mode_from_path(lat1_paths[0])
     lat1 = next((p for p in lat1_paths if p.endswith(f"_{mode}.csv")), lat1_paths[0])

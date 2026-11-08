@@ -344,7 +344,7 @@ echo
 echo "8. Process placement (cgroup.procs)"
 LEAF_REL=""
 for idx in "${SORTED_IDX[@]}"; do
-    if [[ "${SECTIONS[$idx]}" == client1_steady || "${SECTIONS[$idx]}" == client2_noisy ]]; then
+    if [[ "${SECTIONS[$idx]}" == client[0-9]* ]]; then
         LEAF_REL="${TEST_PREFIX}/${CGROUP_NAMES[$idx]}"
         break
     fi

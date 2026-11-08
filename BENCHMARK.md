@@ -39,8 +39,11 @@ writeback amplifies the miss penalty beyond what memory sizing alone can fix.
 ```
 .
 ├── fairness_configs.ini           # Workload definitions (victim + aggressor)
+├── fairness_configs_multi.ini     # Three tenants: two good readers + one noisy neighbor
 ├── cgroup_shared.ini              # Shared-cache cgroup layout (2G pool)
+├── cgroup_shared_multi.ini        # Same 2G pool, three nested tenants
 ├── cgroup_isolated.ini            # Isolated per-tenant cgroup layout
+├── cgroup_isolated_multi.ini      # Isolated layout for the three-tenant run
 ├── check_cgroups.sh               # Pre-flight cgroup v2 validation script
 ├── benchmark.c                    # C benchmark implementation
 ├── benchmark                      # Compiled C binary
@@ -261,7 +264,15 @@ sudo ./benchmark -v --drop-once --senpai --cgroup-config cgroup_shared.ini -m ca
 sudo ./benchmark -v --drop-once --senpai-high --cgroup-config cgroup_shared.ini -m cached -o results/senpai_high dual
 ```
 
-Stdout goes to `<output>/senpai/senpai_client2_noisy_cached.log`. `--senpai` also writes `<output>/senpai/controller_cached.csv`. Client2's 1 Hz timeseries still samples `memory.high`. `--senpai` also takes `--senpai-victim`, `--senpai-p99-target`, `--senpai-low-min`, and `--senpai-low-max`.
+Stdout goes to `<output>/senpai/senpai_<noisy>_<mode>.log`. `--senpai` also writes `<output>/senpai/controller_<mode>.csv`. `--senpai-client` and `--senpai-victim` are repeatable. On `dual` the defaults stay `client2_noisy` and `client1_steady`.
+
+## Three tenants
+
+`fairness_configs_multi.ini` runs two 256 MiB good tenants and one 32 GiB noisy neighbor. `client3_noisy` reads the existing `test_file_client2_noisy_32G` (`filename` in the ini) instead of allocating a second 32G file.
+
+```bash
+sudo ./benchmark -v --drop-once -c fairness_configs_multi.ini --cgroup-config cgroup_shared_multi.ini -m cached -o results/multi multi
+```
 
 ## 📈 Understanding Results
 

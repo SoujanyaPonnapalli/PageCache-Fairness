@@ -153,6 +153,111 @@ def print_column_legend():
         print(line)
 
 
+def latency_clients(ts_dir, mode):
+    suffix = f"_latency_{mode}.csv"
+    names = []
+    for path in sorted(glob(os.path.join(ts_dir, "*" + suffix))):
+        base = os.path.basename(path)
+        if base.startswith("per_second"):
+            continue
+        names.append(base[:-len(suffix)])
+    return names
+
+
+def infer_mode(ts_dir):
+    modes = []
+    for path in sorted(glob(os.path.join(ts_dir, "*_latency_*.csv"))):
+        base = os.path.basename(path)
+        if base.startswith("per_second"):
+            continue
+        mark = base.rfind("_latency_")
+        if mark < 0:
+            continue
+        mode = base[mark + len("_latency_"):-4]
+        if mode not in modes:
+            modes.append(mode)
+    if "cached" in modes:
+        return "cached"
+    return modes[0] if modes else None
+
+
+def report_multi(results_dir, ts_dir, mode, user_path, no_write):
+    """One row per client per second. Used when the run is not the two-tenant pair."""
+    names = latency_clients(ts_dir, mode)
+    if not names:
+        print(f"error: no *_latency_{mode}.csv under {ts_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    series = {}
+    for name in names:
+        path = os.path.join(ts_dir, f"{name}_latency_{mode}.csv")
+        series[name] = {int(r["wall_time"]): float(r["p99_us"]) for r in load_csv(path)}
+
+    highs = {}
+    lows = {}
+    for name in names:
+        path = os.path.join(ts_dir, f"{name}_{mode}.csv")
+        highs[name] = {}
+        lows[name] = {}
+        if not os.path.isfile(path):
+            continue
+        for row in load_csv(path):
+            t = int(row["wall_time"])
+            if "memory_high_bytes" in row:
+                highs[name][t] = row["memory_high_bytes"]
+            if "memory_low_bytes" in row:
+                lows[name][t] = row["memory_low_bytes"]
+
+    memstat = os.path.join(results_dir, "memstat", f"{names[0]}_{mode}.csv")
+    windows = phase_windows(memstat) if os.path.isfile(memstat) else {}
+    keys = sorted(set().union(*series.values()))
+
+    rows = []
+    for t in keys:
+        phase = label_phase(t, windows) if windows else "gap"
+        for name in names:
+            rows.append({
+                "wall_time": t,
+                "phase": phase,
+                "client": name,
+                "p99_us": series[name].get(t),
+                "memory_high_bytes": highs[name].get(t),
+                "memory_low_bytes": lows[name].get(t),
+            })
+
+    out_path = None
+    if not no_write:
+        dest = user_path or os.path.join(ts_dir, "per_second_latency_timeseries.csv")
+        try:
+            with open(dest, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["wall_time", "phase", "client", "p99_us",
+                            "memory_high_bytes", "memory_low_bytes"])
+                for row in rows:
+                    w.writerow([
+                        row["wall_time"], row["phase"], row["client"],
+                        csv_cell_p99(row["p99_us"]),
+                        csv_cell_mhigh(row["memory_high_bytes"]),
+                        csv_cell_mhigh(row["memory_low_bytes"]),
+                    ])
+            out_path = dest
+        except OSError as e:
+            print(f"warning: could not write {dest}: {e}", file=sys.stderr)
+
+    print(f"# PER-SECOND LATENCY — {results_dir}")
+    print(f"# clients: {', '.join(names)}")
+    if out_path:
+        print(f"# wrote {out_path} ({len(rows)} rows)")
+    print()
+    header = f"{'wall_time':>12} {'phase':>10} {'client':<16} {'p99_us':>12} {'mem.high':>12} {'mem.low':>12}"
+    print(header)
+    for row in rows:
+        print(f"{row['wall_time']:12d} {row['phase']:>10} {row['client']:<16} "
+              f"{fmt_p99(row['p99_us'])} "
+              f"{fmt_bytes(row['memory_high_bytes']):>12} "
+              f"{fmt_bytes(row['memory_low_bytes']):>12}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -175,8 +280,12 @@ def main():
 
     lat1_paths = sorted(glob(os.path.join(ts_dir, "client1_steady_latency_*.csv")))
     if not lat1_paths:
-        print("error: need client1_steady_latency_*.csv", file=sys.stderr)
-        sys.exit(1)
+        mode = args.mode or infer_mode(ts_dir)
+        if not mode:
+            print("error: no *_latency_*.csv", file=sys.stderr)
+            sys.exit(1)
+        report_multi(results_dir, ts_dir, mode, args.output, args.no_write)
+        return
 
     mode = args.mode or ts_mode_from_path(lat1_paths[0])
     lat1 = next((p for p in lat1_paths if p.endswith(f"_{mode}.csv")), lat1_paths[0])

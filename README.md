@@ -254,10 +254,11 @@ The benchmark harness is the C suite in this repository (`benchmark.c`, workload
 
 ### What the harness measures
 - Dual-tenant runs: Tenant A (`client1_steady`, rate-limited `randread`) and Tenant B (`client2_noisy`). Either client can run alone as a baseline.
+- Three-tenant runs (`fairness_configs_multi.ini`, mode `multi`): two 256 MiB good tenants and one 32 GiB noisy neighbor on the same 2G pool.
 - Mechanism 1 by default (B is a large clean sequential read). Switch `[client2_noisy]` to buffered `randwrite` for mechanism 2.
 - Shared pool (`cgroup_shared.ini`) and isolated cgroups (`cgroup_isolated.ini`, `memory.max` and `memory.min` set to 1G per tenant).
 - Per-phase fio latency (avg / p50 / p99 / p999), plus 1 Hz PSI, refaults, dirty pages, and `io.stat`.
-- Optional `--senpai`: the fairness fork sizes Tenant B's `memory.high` and Tenant A's `memory.low`. `--senpai-high` is upstream Senpai on Tenant B's `memory.high` only.
+- Optional `--senpai`: the fairness fork sizes each noisy neighbor's `memory.high` and each good tenant's `memory.low`. `--senpai-high` is upstream Senpai on one noisy neighbor's `memory.high`.
 
 ---
 

@@ -51,16 +51,19 @@ penalty beyond what memory sizing alone can fix — the core result.
 | File | Role |
 |---|---|
 | `benchmark.c` | The whole harness: config parsing, fio command building, cgroup setup, run orchestration, telemetry sampling. |
-| `fairness_configs.ini` | Workload definitions: `client1_steady` + `client2_noisy` only. |
+| `fairness_configs.ini` | Two-tenant workloads: `client1_steady` + `client2_noisy`. |
+| `fairness_configs_multi.ini` | Three tenants: `client1_good`, `client2_good` (256M randread), `client3_noisy` (32G sequential read). |
 | `cgroup_shared.ini` | Shared-pool cgroup layout (2G parent cap; both tenants under it). |
+| `cgroup_shared_multi.ini` | Same 2G parent, three nested tenants. |
 | `cgroup_isolated.ini` | Isolated layout. Each tenant has `memory.max` and `memory.min` set to 1G. |
+| `cgroup_isolated_multi.ini` | Isolated layout for the three-tenant run. |
 | `check_cgroups.sh` | Pre-flight cgroup v2 validation (mirrors harness cgroup setup). |
 | `setup_test_files.sh` | Optional one-time creation of dense size-tagged test files. |
 | `Makefile` | Build + convenience run targets (`-lm` for the clat percentile math). |
 | `benchmark_analysis.py` | Reads a results dir and prints p99, refault deltas, per-phase memory/IO utilization, PSI stalls. |
 | `report_io_utilization.py` | Per-second join: p99, `io.stat` throughput, `io.pressure`, page-cache residency. |
 | `report_latency_timeseries.py` | Per-second join: Client1 p99 vs Client2 `memory.high`, labeled by phase. |
-| `senpai.py` | Optional. `--senpai` sizes Client2 `memory.high` and Client1 `memory.low`. |
+| `senpai.py` | Optional. `--senpai` sizes each noisy neighbor's `memory.high` and each good tenant's `memory.low`. |
 | `senpai_high.py` | Optional. `--senpai-high` runs upstream Senpai on Client2 `memory.high`. |
 | `benchmark_results/` | Output (created on first run; `-o` overrides). |
 | `summary.md` | This document. |
@@ -97,7 +100,7 @@ top-to-bottom:
      → `psi/<cg>_<mode>.csv`
    - per-tenant 1 Hz timeseries: `memory.current`, `memory.stat` `file`,
      refaults, memory/io PSI totals, and `io.stat` `rios`/`wios`/`rbytes`/
-     `wbytes` (plus `memory.high` for client2)
+     `wbytes`, plus `memory.high` and `memory.low` for every client
      → `timeseries/<client>_<mode>.csv`
    - bpftrace (default): cumulative memstall / iowait entry counts
      → `psi_entries/run_<mode>.csv`
@@ -355,11 +358,12 @@ read vs write B; plot B intensity (X) vs A p99 (Y).
 ## 9. Command-line reference
 
 ```
-./benchmark [options] <workload | dual | all>
+./benchmark [options] <workload | dual | multi | all>
 
   <workload>   Run a single [section] from the config (baseline/characterization)
   dual         Run client1_steady (A) + client2_noisy (B) concurrently (primary)
-  all          Run every [section] in the config
+  multi        Run every [section] in the config concurrently
+  all          Run every [section], one at a time
 
   -c, --config PATH        Workload ini            (default: fairness_configs.ini)
       --cgroup-config PATH  cgroup layout ini (enables cgroup setup)
@@ -373,8 +377,8 @@ read vs write B; plot B intensity (X) vs A p99 (Y).
       --senpai             After phase 0, run senpai.py (memory.high + victim memory.low)
       --senpai-high        After phase 0, run senpai_high.py on Client2 memory.high
       --senpai-script PATH Script path             (default: ./senpai.py or ./senpai_high.py)
-      --senpai-client NAME Client2 section         (default: client2_noisy)
-      --senpai-victim NAME Client1 section         (default: client1_steady; --senpai only)
+      --senpai-client NAME Noisy neighbor          (repeatable; default client2_noisy, else *noisy*)
+      --senpai-victim NAME Good tenant             (repeatable; default client1_steady, else the rest)
       --senpai-p99-target N  Client1 p99 SLO in µs (default: 3.0; --senpai only)
       --senpai-low-min N   Client1 memory.low floor (--senpai only)
       --senpai-low-max N   Client1 memory.low ceiling (default: 2G; --senpai only)
@@ -558,11 +562,13 @@ Disable recording if needed:
 
 ### Fairness Senpai (`--senpai`)
 
-`--senpai` forks `senpai.py` after phase 0. Client2 `memory.high` still follows
-PSI, and upward moves are suppressed while Client2 is displacing Client1.
-Client1 `memory.low` moves from the shared parent's fullness, live cache
-retention, and Client1 p99. Stdout is `senpai/senpai_<client>_<mode>.log`;
-per-tick decisions are `senpai/controller_<mode>.csv`.
+`--senpai` forks `senpai.py` after phase 0. Each noisy neighbor's `memory.high`
+follows PSI, and an upward move is suppressed only while that neighbor is
+displacing a good tenant. Each good tenant's `memory.low` moves from the shared
+parent's fullness, that tenant's live cache retention, and that tenant's p99.
+On `dual` the two roles are still `client2_noisy` and `client1_steady`. Stdout
+is `senpai/senpai_<noisy>_<mode>.log`; per-tick decisions are
+`senpai/controller_<mode>.csv` (one row per tenant).
 
 ```bash
 sudo ./benchmark -v --drop-once --senpai \
@@ -570,10 +576,26 @@ sudo ./benchmark -v --drop-once --senpai \
   -m cached -o results/senpai dual
 ```
 
+### Three tenants (`multi`)
+
+`fairness_configs_multi.ini` runs two 256 MiB good tenants and one 32 GiB noisy
+neighbor together. Their combined hot set is 512 MiB, the same footprint as
+`client1_steady`. `client3_noisy` reads `test_file_client2_noisy_32G`.
+`--senpai` protects `client1_good` and `client2_good`
+separately and sizes `client3_noisy`'s `memory.high`.
+
+```bash
+sudo ./benchmark -v --drop-once --senpai \
+  -c fairness_configs_multi.ini \
+  --cgroup-config cgroup_shared_multi.ini \
+  -m cached -o results/senpai_multi multi
+```
+
 ### Upstream Senpai (`--senpai-high`)
 
-`--senpai-high` forks `senpai_high.py` after phase 0 and sizes only Client2's
-`memory.high` from memory PSI. It does not set Client1 `memory.low`. The
+`--senpai-high` forks `senpai_high.py` after phase 0 and sizes one noisy
+neighbor's `memory.high` from memory PSI (`client2_noisy` on `dual`). It does
+not set `memory.low`. The
 process is stopped when the run finishes. Stdout is
 `senpai/senpai_<client>_<mode>.log`.
 
