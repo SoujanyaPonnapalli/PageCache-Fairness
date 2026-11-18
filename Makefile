@@ -1,62 +1,36 @@
-# Makefile for Fairness Benchmark C++ Implementation
+CC      ?= gcc
+CFLAGS  ?= -std=c11 -O2 -Wall -Wextra -D_GNU_SOURCE
+LDFLAGS ?= -lm
+TARGET   = benchmark
+SRC      = benchmark.c
 
-CXX = g++
-CXXFLAGS = -std=c++17 -Wall -Wextra -Wpedantic -O2
-TARGET = fairness_benchmark
-SOURCE = fairness_benchmark.cpp
-SEQ_TARGET = sequential_benchmark
-SEQ_SOURCE = sequential_benchmark.cpp
+.PHONY: all clean test run-all analyze workflow setup-files
 
-# Default target - build both benchmarks
-all: $(TARGET) $(SEQ_TARGET)
+all: $(TARGET)
 
-$(TARGET): $(SOURCE)
-	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SOURCE)
+$(TARGET): $(SRC)
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
-$(SEQ_TARGET): $(SEQ_SOURCE)
-	$(CXX) $(CXXFLAGS) -o $(SEQ_TARGET) $(SEQ_SOURCE)
-
-# Clean built files
 clean:
-	rm -f $(TARGET) $(SEQ_TARGET)
+	rm -f $(TARGET)
 
-# Install system dependencies
-install-deps:
-	@echo "Installing dependencies..."
-	@if command -v brew >/dev/null 2>&1; then \
-		echo "Installing fio via brew..."; \
-		brew install fio; \
-	elif command -v apt-get >/dev/null 2>&1; then \
-		echo "Installing fio via apt..."; \
-		sudo apt-get update && sudo apt-get install -y fio; \
-	elif command -v dnf >/dev/null 2>&1; then \
-		echo "Installing fio via dnf..."; \
-		sudo dnf install -y fio; \
-	else \
-		echo "Please install fio manually for your system"; \
-	fi
+# Create dense test_file_1G / test_file_8G once (reuse across experiments)
+setup-files:
+	bash ./setup_test_files.sh
 
-# Test the benchmark (single workload)
+# Run a single-workload baseline
 test: $(TARGET)
-	./$(TARGET) steady_reader_d1
+	./$(TARGET) -v client1_steady
 
-# Run all benchmarks
-benchmark: $(TARGET)
+# Run every workload defined in the config
+run-all: $(TARGET)
 	./$(TARGET) all
 
-# Analyze results
+# Analyze existing results
 analyze:
-	./quick_fairness_analysis.py fairness_results/
+	./benchmark_analysis.py benchmark_results/
 
-# Complete workflow: build, run, analyze
-workflow: $(TARGET)
-	@echo "=== Building C++ Fairness Benchmark ==="
-	@echo "✓ Binary compiled successfully"
-	@echo ""
-	@echo "=== Running Single Test ==="
-	./$(TARGET) -v steady_reader_d1
-	@echo ""
-	@echo "=== Analyzing Results ==="
-	./quick_fairness_analysis.py fairness_results/
-
-.PHONY: all clean install-deps test benchmark analyze workflow
+# Full build -> ensure files -> dual experiment -> analyze
+workflow: $(TARGET) setup-files
+	./$(TARGET) -m cached dual
+	./benchmark_analysis.py benchmark_results/
