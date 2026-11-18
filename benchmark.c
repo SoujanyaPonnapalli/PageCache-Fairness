@@ -127,13 +127,12 @@ static struct {
     bool        use_senpai;        /* fork senpai.py (memory.high + victim memory.low) */
     bool        senpai_script_set; /* user passed --senpai-script */
     const char *senpai_script;     /* senpai_high.py or senpai.py */
-    const char *senpai_client;     /* Client2: memory.high from PSI */
-    const char *senpai_victim;     /* Client1: memory.low from p99 (senpai.py only) */
+    const char *senpai_client;     /* Client2 cgroup for senpai.py / senpai_high.py */
+    const char *senpai_victim;     /* Client1 cgroup (senpai.py only) */
     long        senpai_min_size;
     long        senpai_max_size;
     int         senpai_interval;
     int         senpai_pressure;
-    double      senpai_p99_target;   /* Client1 p99 SLO in µs */
     long        senpai_low_min_size;
     long        senpai_low_max_size;
 } opt = {

@@ -1,883 +1,364 @@
 #!/usr/bin/env python3
-#
-# Copyright (c) Facebook, Inc. and its affiliates.
-#
-# This software may be used and distributed according to the terms of the
-# GNU General Public License version 2.
-#
-# Customized fork of facebookincubator/senpai for the page-cache fairness
-# benchmark. Upstream (memory.high-only) lives in senpai_high.py.
-#
-# Dual control:
-#   Client2 (noisy, positional cgpath)
-#       memory.high from PSI, except upward expansion is suppressed while
-#       the fairness controller observes victim cache displacement.
-#
-#   Client1 (victim, --victim-cgpath)
-#       memory.low is raised only when all of the following hold:
-#         1. shared parent is at/near memory.max (or hit max this tick),
-#         2. Client1's target-file nr_cache retention is low/falling, and
-#         3. Client2's nr_cache is growing or occupies a large share of the
-#            parent memory budget.
-#
-#       p99 is an application-level harm signal and provides a slack/healthy
-#       band for deciding when protection can safely be relaxed.
-#
-# The benchmark harness should start this script only after phase 0 (Client1
-# warmup) so neither controller moves knobs during warm-up.
+"""Sample-driven cgroup-v2 memory controller with dynamic victim identification.
+
+At each tick, clients with memory.current < capacity/number_of_clients are
+classified as victims; the others are bursty. This is a *heuristic role*, not a
+proof of latency sensitivity. Victims receive refault-proportional memory.low
+protection; bursty clients can borrow remaining space through memory.high.
+
+No benchmark file size, IOPS, or block size is used. The two-tenant harness
+interface is supported, and additional clients can be passed with
+--client-cgpath. Run --dry-run on a dedicated cgroup hierarchy first.
+"""
+from __future__ import annotations
 
 import argparse
 import csv
-import datetime
 import os
+import sys
 import time
 from dataclasses import dataclass
-from typing import Optional
+from pathlib import Path
 
-PAGE_SIZE = 4096
-
-
-def h(x):
-    """Translate a number of bytes to a human-readable string."""
-    if x is None:
-        return "n/a"
-    order = 0
-    suffix = ['', 'k', 'M', 'G', 'T']
-    max_order = len(suffix) - 1
-    x = float(x)
-    while abs(x) > 1024 and order < max_order:
-        x /= 1024.0
-        order += 1
-    return '%.2f%s' % (x, suffix[order])
+MIB = 1024 * 1024
+PAGE = os.sysconf('SC_PAGE_SIZE')
 
 
-def log(string):
-    """Log timestamped information to stdout."""
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(ts + ' ' + string, flush=True)
+def clamp(value, lo, hi):
+    return max(lo, min(value, hi))
 
 
-def pct(x):
-    return "n/a" if x is None else f"{100.0 * x:.1f}%"
+def aligned(value):
+    return max(0, int(value) // PAGE * PAGE)
 
 
-class Cgroup(object):
-    def __init__(self, path, limit_min=0, limit_max=(1 << 63) - 1,
-                 manage_high=True, manage_low=False,
-                 low_min=0, low_max=None):
-        self.path = path
-        self.limit = None
-        self.limit_min = limit_min
-        self.limit_max = limit_max
-        self.low = None
-        self.low_min = low_min
-        self.low_max = limit_max if low_max is None else low_max
-        self.manage_high = manage_high
-        self.manage_low = manage_low
-
-        if manage_high:
-            self.pressure()  # Ensure PSI is available.
-            self.set_limit(None)
-
-        if manage_low:
-            # Preserve memory.low from the cgroup config. Do NOT initialize it
-            # from memory.current; fairness protection should be added only
-            # after the controller observes contention.
-            self.low = self.read_low()
-            self.low = max(self.low_min, min(self.low_max, self.low))
-            self.low &= ~(PAGE_SIZE - 1)
-            if self.read_low() != self.low:
-                self.write("memory.low", str(self.low))
-                log(f'Adjusted Client1 memory.low to {h(self.low)}')
-            else:
-                log(f'Preserving Client1 memory.low={h(self.low)}')
-
-    # PSI format:
-    # some avg10=0.00 avg60=0.00 avg300=0.00 total=0
-    # full avg10=0.00 avg60=0.00 avg300=0.00 total=0
-
-    def pressure(self):
-        return float(self.readlines("memory.pressure")[0].split()[1].split('=')[1])
-
-    def total(self):
-        return int(self.readlines("memory.pressure")[0].split()[4].split('=')[1])
-
-    # Client2: PSI -> memory.high
-
-    def scale_limit(self, factor):
-        x = self.read_limit()
-        x = int(x + x * factor)
-        self.set_limit(x)
-
-    def set_limit(self, limit):
-        self.import_limit(limit)
-        self.write("memory.high", str(self.limit))
-
-    def import_limit(self, limit):
-        """Sanitize memory.high candidate and store it in self.limit."""
-        # Keep upstream Senpai's resynchronization behavior. On initialization,
-        # self.limit is None, so memory.high is reset from memory.current.
-        if self.read_limit() != self.limit:
-            log('Resetting Client2 memory.high to memory.current.')
-            limit = self.read_current()
-        limit = max(self.limit_min, min(self.limit_max, limit))
-        limit &= ~(PAGE_SIZE - 1)
-        self.limit = limit
-
-    # Client1: fairness controller -> memory.low
-
-    def set_low(self, low):
-        self.import_low(low)
-        if self.read_low() != self.low:
-            self.write("memory.low", str(self.low))
-
-    def import_low(self, low):
-        """Clamp memory.low without deriving it from memory.current."""
-        if low is None:
-            low = self.read_low()
-        low = max(self.low_min, min(self.low_max, low))
-        low &= ~(PAGE_SIZE - 1)
-        self.low = low
-
-    def adjust_low_bytes(self, delta):
-        """Adjust memory.low by an absolute number of bytes."""
-        old = self.read_low()
-        new = max(self.low_min, min(self.low_max, old + delta))
-        new &= ~(PAGE_SIZE - 1)
-        if new != old:
-            self.write("memory.low", str(new))
-        self.low = new
-        return old, new
-
-    # Generic cgroupfs helpers
-
-    def read_current(self):
-        return int(self.read("memory.current").strip())
-
-    def read_max(self):
-        x = self.read("memory.max").strip()
-        if x == "max":
-            return None
-        return int(x)
-
-    def read_limit(self):
-        x = self.read("memory.high").strip()
-        if x == "max":
-            return (1 << 64) - 1
-        return int(x)
-
-    def read_low(self):
-        x = self.read("memory.low").strip()
-        if x == "max":
-            return (1 << 64) - 1
-        return int(x)
-
-    def read_event(self, name, local=True):
-        filename = "memory.events.local" if local else "memory.events"
-        try:
-            for line in self.readlines(filename):
-                fields = line.split()
-                if len(fields) == 2 and fields[0] == name:
-                    return int(fields[1])
-        except (OSError, ValueError):
-            return 0
-        return 0
-
-    def read(self, filename):
-        with open(os.path.join(self.path, filename)) as f:
-            return f.read()
-
-    def readlines(self, filename):
-        with open(os.path.join(self.path, filename)) as f:
-            return f.readlines()
-
-    def write(self, filename, string):
-        with open(os.path.join(self.path, filename), 'w') as f:
-            f.write(string)
+def number(path: Path, name: str, *, allow_max=False):
+    raw = (path / name).read_text().strip()
+    return None if allow_max and raw == 'max' else int(raw)
 
 
-def read_live_float(path):
-    """Read one-line live file: wall_time,value -> (int, float) or None."""
-    if not path:
-        return None
-    try:
-        with open(path) as f:
-            wall_s, value_s = f.read().strip().split(",", 1)
-        return int(float(wall_s)), float(value_s)
-    except (OSError, ValueError):
-        return None
+def fields(path: Path, name: str):
+    return {parts[0]: int(parts[1]) for row in (path / name).read_text().splitlines()
+            if len(parts := row.split()) >= 2}
 
 
-def read_live_int(path):
-    """Read one-line live file: wall_time,value -> (int, int) or None."""
-    if not path:
-        return None
-    try:
-        with open(path) as f:
-            wall_s, value_s = f.read().strip().split(",", 1)
-        return int(float(wall_s)), int(float(value_s))
-    except (OSError, ValueError):
-        return None
+def psi_some(path: Path):
+    for row in (path / 'memory.pressure').read_text().splitlines():
+        parts = row.split()
+        if parts and parts[0] == 'some':
+            return int(next(x[6:] for x in parts[1:] if x.startswith('total=')))
+    raise ValueError(f'PSI some total missing for {path}')
 
 
-def sample_is_fresh(sample, max_age):
-    if sample is None:
-        return False
-    wall_time, _ = sample
-    return abs(time.time() - wall_time) <= max_age
+def read_bytes(path: Path):
+    return sum(int(part[7:]) for row in (path / 'io.stat').read_text().splitlines()
+               for part in row.split()[1:] if part.startswith('rbytes='))
 
 
-def resolve_file_size(path, explicit_size):
-    if explicit_size is not None:
-        return explicit_size
-    if not path:
-        return None
-    try:
-        return os.stat(path).st_size
-    except OSError:
-        return None
+def delta_counter(current, previous):
+    return max(0, current - previous)
+
+
+@dataclass(frozen=True)
+class Sample:
+    usage: int
+    file_cache: int
+    refault_pages: int
+    pgsteal_pages: int
+    high_events: int
+    psi_us: int
+    rbytes: int
+
+
+def sample(path: Path):
+    st, ev = fields(path, 'memory.stat'), fields(path, 'memory.events.local')
+    return Sample(number(path, 'memory.current'), st['file'],
+                  st['workingset_refault_file'], st['pgsteal'], ev['high'],
+                  psi_some(path), read_bytes(path))
+
+
+@dataclass(frozen=True)
+class Change:
+    usage_delta: int
+    cache_delta: int
+    refault_bytes: int
+    pgsteal_bytes: int
+    high_delta: int
+    psi_delta_us: int
+    rbytes_delta: int
+
+
+def changes(current: Sample, old: Sample):
+    return Change(current.usage - old.usage,
+                  current.file_cache - old.file_cache,
+                  delta_counter(current.refault_pages, old.refault_pages) * PAGE,
+                  delta_counter(current.pgsteal_pages, old.pgsteal_pages) * PAGE,
+                  delta_counter(current.high_events, old.high_events),
+                  delta_counter(current.psi_us, old.psi_us),
+                  delta_counter(current.rbytes, old.rbytes))
 
 
 @dataclass
-class Sample:
-    wall_time: int
-
-    parent_current: Optional[int]
-    parent_max: Optional[int]
-    parent_util: Optional[float]
-    parent_max_event_delta: int
-    parent_hot: bool
-
-    c1_p99: Optional[float]
-    c1_p99_new: bool
-
-    c1_nr_cache: Optional[int]
-    c1_nr_cache_new: bool
-    c1_nr_cache_delta: Optional[int]
-    c1_retention: Optional[float]
-    c1_retention_delta: Optional[float]
-    c1_parent_cache_ratio: Optional[float]
-
-    c2_nr_cache: Optional[int]
-    c2_nr_cache_new: bool
-    c2_nr_cache_delta: Optional[int]
-    c2_retention: Optional[float]
-    c2_parent_cache_ratio: Optional[float]
-
-    c1_retention_low: bool
-    c1_retention_healthy: bool
-    c1_cache_falling: bool
-    c2_cache_growing: bool
-    c2_cache_dominant: bool
-
-    p99_bad: bool
-    p99_healthy: bool
-    p99_slack: bool
-
-    c2_psi_avg10: float
-    c2_psi_total: int
-    c2_psi_delta: int
-    c2_psi_integral: int
+class Tenant:
+    path: Path
+    sample: Sample
+    protection: float
+    quiet: int = 0
+    role: str = 'unknown'
 
 
-class Senpai(object):
-    def __init__(self, conf):
-        self.conf = conf
-        log('Configuration:')
-        for key, val in vars(conf).items():
-            log(f'  {key} = {val}')
+def decide(args, capacity, parent_usage, samples, diffs, protections,
+           quiets, old_highs, dt):
+    """Pure policy, returning (lows, highs, protections, quiets, details).
 
-        # Client2 (noisy neighbor): upstream PSI -> memory.high controller.
-        self.cgroup = Cgroup(
-            self.conf.cgpath,
-            self.conf.min_size,
-            self.conf.max_size,
-        )
-        self.last_total = self.cgroup.total()
-        self.integral = 0
-        self.grace_ticks = self.conf.interval
+    Victim criterion is based solely on observed usage relative to fair share.
+    Victim budget uses ACTUAL victim usage, not memory.low. High ceilings
+    are planning targets: memory.high is soft and can be exceeded.
+    """
+    names = list(samples)
+    n = len(names)
+    fair = capacity / n
+    reserve = int(args.reserve_headroom_mib * MIB)
+    budget = max(0, capacity - reserve)
+    victims = [k for k in names if samples[k].usage < fair]
+    bursty = [k for k in names if k not in victims]
+    victim_usage = sum(samples[k].usage for k in victims)
 
-        # Shared parent is read-only from this controller's perspective.
-        self.parent = None
-        self.last_parent_max_events = 0
-        if self.conf.parent_cgpath:
-            self.parent = Cgroup(
-                self.conf.parent_cgpath,
-                manage_high=False,
-                manage_low=False,
-            )
-            self.last_parent_max_events = self.parent.read_event("max")
-
-        # Client1 (victim): memory.low from contention + retention + p99.
-        self.victim = None
-        self.low_grace_ticks = self.conf.low_interval
-
-        self.last_p99_wall_time = None
-        self.last_c1_cache_wall_time = None
-        self.last_c2_cache_wall_time = None
-        self.last_c1_nr_cache = None
-        self.last_c2_nr_cache = None
-        self.last_c1_retention = None
-
-        self.c1_file_size = resolve_file_size(
-            self.conf.victim_file,
-            self.conf.victim_file_size,
-        )
-        self.c2_file_size = resolve_file_size(
-            self.conf.noisy_file,
-            self.conf.noisy_file_size,
-        )
-
-        if self.conf.victim_cgpath:
-            self.victim = Cgroup(
-                self.conf.victim_cgpath,
-                self.conf.min_size,
-                self.conf.max_size,
-                manage_high=False,
-                manage_low=True,
-                low_min=self.conf.low_min_size,
-                low_max=self.conf.low_max_size,
-            )
-            log(
-                'Client1 fairness control armed '
-                f'(p99 target={self.conf.p99_target:.1f}±{self.conf.p99_delta:.1f} us, '
-                f'parent_hot>={self.conf.parent_util_threshold:.0%}, '
-                f'retention_low<{self.conf.retention_low:.0%}, '
-                f'retention_healthy>={self.conf.retention_healthy:.0%})'
-            )
-            log(f'Client1 target-file size={h(self.c1_file_size)}')
-            log(f'Client2 target-file size={h(self.c2_file_size)}')
+    # C1-style protection now applies to every dynamically detected victim,
+    # and can grow beyond its fair share based on observed refaults.
+    next_p, next_q, reasons = {}, {}, {}
+    for k in names:
+        s, d = samples[k], diffs[k]
+        quiet_now = (d.refault_bytes == 0 and
+                     d.psi_delta_us / max(dt * 1_000_000, 1) <= args.psi_quiet_fraction)
+        q = quiets[k] + 1 if quiet_now else 0
+        p = protections[k]
+        if d.refault_bytes > 0:
+            p += args.gain_up * d.refault_bytes
+            why = 'raise_refault'
+        elif q >= args.quiet_intervals and s.usage < p:
+            p -= args.gain_down * (p - s.usage)
+            why = 'release_unused'
         else:
-            log('No --victim-cgpath; Client1 memory.low control disabled')
+            why = 'hold'
+        # No min(protected, fair) clamp; only global capacity bounds.
+        next_p[k] = clamp(p, args.low_min_size, min(args.low_max_size, budget))
+        next_q[k] = q
+        reasons[k] = why
 
-        self._init_controller_csv()
+    # Avoid aggregate memory.low overcommit. Prioritize current victims; the
+    # remaining budget may protect bursty tenants too, but does not guarantee
+    # each could simultaneously demand all of its desired protection.
+    lows = {}
+    remaining = budget
+    for k in victims + bursty:
+        grant = aligned(min(next_p[k], remaining))
+        lows[k] = grant
+        remaining = max(0, remaining - grant)
 
-    def _init_controller_csv(self):
-        if not self.conf.controller_csv:
-            return
-        parent_dir = os.path.dirname(self.conf.controller_csv)
-        if parent_dir:
-            os.makedirs(parent_dir, exist_ok=True)
-        if os.path.exists(self.conf.controller_csv) and os.path.getsize(self.conf.controller_csv) > 0:
-            return
-        with open(self.conf.controller_csv, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                'wall_time',
-                'parent_current', 'parent_max', 'parent_util',
-                'parent_max_event_delta', 'parent_hot',
-                'c1_p99_us', 'p99_bad', 'p99_healthy', 'p99_slack',
-                'c1_nr_cache', 'c1_nr_cache_delta', 'c1_retention',
-                'c1_retention_delta', 'c1_parent_cache_ratio',
-                'c1_retention_low', 'c1_retention_healthy', 'c1_cache_falling',
-                'c2_nr_cache', 'c2_nr_cache_delta', 'c2_retention',
-                'c2_parent_cache_ratio', 'c2_cache_growing', 'c2_cache_dominant',
-                'c2_psi_avg10', 'c2_psi_delta', 'c2_psi_integral',
-                'fairness_active', 'c1_memory_low', 'c2_memory_high',
-                'low_action', 'high_action',
-            ])
+    # For each bursty tenant, subtract all victim ACTUAL usage. With multiple
+    # bursty tenants, account for other bursty tenants' current footprints too
+    # to avoid giving every bursty client an identical full shared allowance.
+    ceilings = {}
+    for k in names:
+        others_bursty = sum(samples[j].usage for j in bursty if j != k)
+        ceilings[k] = aligned(max(0, budget - victim_usage - others_bursty))
 
-    def run(self):
-        while True:
-            time.sleep(1)
-            self.tick()
+    highs, growths, high_reasons = {}, {}, {}
+    for k in names:
+        s, d, old_high = samples[k], diffs[k], old_highs[k]
+        if k in victims:
+            # Victims should not be throttled by an outdated low high-limit;
+            # aim for parent capacity. The sum of actual usage is still
+            # bounded by parent memory.max, not by these soft thresholds.
+            highs[k] = aligned(min(args.max_size, budget))
+            growths[k], high_reasons[k] = 0, 'victim_unthrottle'
+            continue
 
-    def tick(self):
-        sample = self.sample_state()
-        fairness_active = self.classify_fairness(sample)
+        ceiling = min(ceilings[k], args.max_size)
+        active = d.high_delta > 0 or d.refault_bytes > 0 or d.cache_delta > 0
+        usable = parent_usage < budget and s.usage < ceiling
+        growth = 0
+        candidate = old_high
+        if active and usable:
+            growth = args.gain_up * max(d.refault_bytes, max(0, d.cache_delta))
+            if growth == 0 and d.high_delta:
+                growth = args.probe_step_mib * MIB
+            candidate = max(old_high, s.usage) + growth
+            why = 'expand' if growth else 'hold_no_growth'
+        elif not active and next_q[k] >= args.quiet_intervals:
+            candidate = old_high - args.gain_down * max(0, old_high - s.usage)
+            why = 'release_unused'
+        else:
+            why = 'hold'
+        highs[k] = aligned(clamp(candidate, min(args.min_size, ceiling), ceiling))
+        growths[k], high_reasons[k] = growth, why
 
-        # Protect the victim first, then decide whether Client2 is allowed to
-        # expand memory.high on this tick.
-        low_action = self.adjust_memory_low(sample, fairness_active)
-        high_action = self.adjust_memory_high(sample, fairness_active)
+    details = dict(fair_share=fair, victims=victims, bursty=bursty,
+                   victim_usage=victim_usage, ceilings=ceilings,
+                   growths=growths, low_reasons=reasons,
+                   high_reasons=high_reasons)
+    return lows, highs, next_p, next_q, details
 
-        self.log_snapshot(sample, fairness_active, low_action, high_action)
-        self.write_controller_csv(sample, fairness_active, low_action, high_action)
 
-    def sample_state(self):
-        now = int(time.time())
+def cli(argv=None):
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('cgpath', help='Legacy harness second client path')
+    p.add_argument('--victim-cgpath', required=True,
+                   help='Legacy harness first client path; role is dynamically inferred')
+    p.add_argument('--client-cgpath', action='append', default=[],
+                   help='Additional client path; repeat for more tenants')
+    p.add_argument('--parent-cgpath', required=True)
+    p.add_argument('--controller-csv')
+    p.add_argument('--control-interval', type=float, default=1.0)
+    p.add_argument('--gain-up', type=float, default=1.0)
+    p.add_argument('--gain-down', type=float, default=0.1)
+    p.add_argument('--quiet-intervals', type=int, default=3)
+    p.add_argument('--psi-quiet-fraction', type=float, default=0.01)
+    p.add_argument('--reserve-headroom-mib', type=float, default=32)
+    p.add_argument('--probe-step-mib', type=float, default=16)
+    p.add_argument('--low-min-size', type=int, default=0)
+    p.add_argument('--low-max-size', type=int, default=2 << 30)
+    p.add_argument('--min-size', type=int, default=0)
+    p.add_argument('--max-size', type=int, default=2 << 30)
+    p.add_argument('--read-amplification', type=float, default=1.0,
+                   help='Diagnostic placeholder only, not used in policy')
+    p.add_argument('--dry-run', action='store_true')
+    p.add_argument('--max-iterations', type=int, default=0)
+    # Legacy benchmark flags are accepted but never used for allocation.
+    for flag in ('--victim-p99', '--victim-nr-cache', '--noisy-nr-cache',
+                 '--victim-file', '--noisy-file', '--victim-latency-csv',
+                 '--noisy-latency-csv'):
+        p.add_argument(flag, default=None, help=argparse.SUPPRESS)
+    for flag in ('--victim-file-size', '--noisy-file-size',
+                 '--victim-block-bytes', '--noisy-block-bytes',
+                 '--low-up', '--low-down', '--coeff-probe', '--coeff-backoff',
+                 '--cache-drop-bytes', '--cache-growth-bytes'):
+        p.add_argument(flag, type=int, default=None, help=argparse.SUPPRESS)
+    for flag in ('--retention-low', '--retention-healthy', '--retention-drop',
+                 '--noisy-parent-cache-threshold', '--parent-util-threshold',
+                 '--p99-target', '--sample-max-age', '--max-probe', '--max-backoff',
+                 '--delta-seconds', '--read-bandwidth-mib', '--ema-alpha'):
+        p.add_argument(flag, type=float, default=None, help=argparse.SUPPRESS)
+    for flag in ('--interval', '--pressure', '--low-interval', '--ramp-up-clients'):
+        p.add_argument(flag, type=int, default=None, help=argparse.SUPPRESS)
+    a = p.parse_args(argv)
+    if (a.control_interval <= 0 or a.gain_up < 0 or not 0 <= a.gain_down <= 1
+            or a.quiet_intervals < 1 or not 0 <= a.psi_quiet_fraction <= 1
+            or a.reserve_headroom_mib < 0 or a.probe_step_mib < 0
+            or a.low_max_size < a.low_min_size or a.max_size < a.min_size
+            or a.max_iterations < 0):
+        p.error('invalid controller parameters')
+    return a
 
-        # ---------- Parent contention ----------
-        parent_current = None
-        parent_max = None
-        parent_util = None
-        parent_max_event_delta = 0
-        parent_hot = False
 
-        if self.parent:
+def main(argv=None):
+    a = cli(argv)
+    parent = Path(a.parent_cgpath)
+    paths = [Path(a.victim_cgpath), Path(a.cgpath)] + list(map(Path, a.client_cgpath))
+    if len({str(x.resolve()) for x in paths}) != len(paths):
+        raise SystemExit('Duplicate client paths')
+    cap = number(parent, 'memory.max', allow_max=True)
+    if cap is None or cap <= 0:
+        raise SystemExit('Finite parent memory.max required')
+    if int(a.reserve_headroom_mib * MIB) >= cap:
+        raise SystemExit('Reserved headroom exceeds parent cap')
+    names = [p.name for p in paths]
+    if len(set(names)) != len(names):
+        raise SystemExit('Client cgroup basenames must be unique')
+    path_of = dict(zip(names, paths))
+    old_samples = {k: sample(p) for k, p in path_of.items()}
+    fair = cap / len(names)
+    protections = {k: float(clamp(s.usage, a.low_min_size,
+                                 min(a.low_max_size, cap)))
+                   for k, s in old_samples.items()}
+    quiets = {k: 0 for k in names}
+    old_t = time.monotonic()
+    log = None
+    writer = None
+    if a.controller_csv:
+        f = Path(a.controller_csv)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        new_file = not f.exists() or f.stat().st_size == 0
+        log = f.open('a', newline='', buffering=1)
+        columns = ['time', 'dt', 'tenant', 'role', 'usage', 'usage_delta',
+                   'file_cache', 'cache_delta', 'refault_bytes', 'pgsteal_bytes',
+                   'high_events_delta', 'psi_delta_us', 'physical_read_bytes',
+                   'protection_target', 'low_before', 'low_target', 'low_after',
+                   'high_before', 'high_target', 'high_after', 'high_ceiling',
+                   'victim_usage_sum', 'fair_share', 'growth_budget',
+                   'low_reason', 'high_reason', 'dry_run']
+        writer = csv.DictWriter(log, fieldnames=columns)
+        if new_file:
+            writer.writeheader()
+    print(f'Dynamic Senpai started: capacity={cap/MIB:.1f}MiB, '
+          f'tenants={len(names)}, fair={fair/MIB:.1f}MiB, dry_run={a.dry_run}',
+          flush=True)
+    ticks = 0
+    try:
+        while not a.max_iterations or ticks < a.max_iterations:
+            time.sleep(a.control_interval)
             try:
-                parent_current = self.parent.read_current()
-                parent_max = self.parent.read_max()
-                if parent_max and parent_max > 0:
-                    parent_util = parent_current / float(parent_max)
-
-                current_events = self.parent.read_event("max")
-                if current_events >= self.last_parent_max_events:
-                    parent_max_event_delta = current_events - self.last_parent_max_events
-                self.last_parent_max_events = current_events
-
-                parent_hot = (
-                    (parent_util is not None and
-                     parent_util >= self.conf.parent_util_threshold)
-                    or parent_max_event_delta > 0
-                )
-            except (OSError, ValueError):
-                pass
-
-        # ---------- Client1 p99 ----------
-        p99_sample = read_live_float(self.conf.victim_p99)
-        c1_p99 = None
-        c1_p99_new = False
-        if sample_is_fresh(p99_sample, self.conf.sample_max_age):
-            p99_wall, c1_p99 = p99_sample
-            c1_p99_new = p99_wall != self.last_p99_wall_time
-            if c1_p99_new:
-                self.last_p99_wall_time = p99_wall
-
-        target = max(self.conf.p99_target, 1e-6)
-        bad_ceil = target + max(self.conf.p99_delta, 0.0)
-        p99_bad = c1_p99 is not None and c1_p99 > bad_ceil
-        p99_healthy = c1_p99 is not None and c1_p99 <= target
-        p99_slack = (
-            c1_p99 is not None
-            and target < c1_p99 <= bad_ceil
-        )
-
-        # ---------- nr_cache live samples ----------
-        c1_sample = read_live_int(self.conf.victim_nr_cache)
-        c2_sample = read_live_int(self.conf.noisy_nr_cache)
-
-        c1_nr_cache = None
-        c1_nr_cache_new = False
-        c1_nr_cache_delta = None
-        c1_retention = None
-        c1_retention_delta = None
-        c1_parent_cache_ratio = None
-
-        if sample_is_fresh(c1_sample, self.conf.sample_max_age):
-            c1_wall, c1_nr_cache = c1_sample
-            c1_nr_cache_new = c1_wall != self.last_c1_cache_wall_time
-
-            if c1_nr_cache_new:
-                if self.last_c1_nr_cache is not None:
-                    c1_nr_cache_delta = c1_nr_cache - self.last_c1_nr_cache
-                self.last_c1_nr_cache = c1_nr_cache
-                self.last_c1_cache_wall_time = c1_wall
-
-            if self.c1_file_size and self.c1_file_size > 0:
-                c1_retention = min(1.0, c1_nr_cache / float(self.c1_file_size))
-                if c1_nr_cache_new and self.last_c1_retention is not None:
-                    c1_retention_delta = c1_retention - self.last_c1_retention
-                if c1_nr_cache_new:
-                    self.last_c1_retention = c1_retention
-
-            if parent_max and parent_max > 0:
-                c1_parent_cache_ratio = c1_nr_cache / float(parent_max)
-
-        c2_nr_cache = None
-        c2_nr_cache_new = False
-        c2_nr_cache_delta = None
-        c2_retention = None
-        c2_parent_cache_ratio = None
-
-        if sample_is_fresh(c2_sample, self.conf.sample_max_age):
-            c2_wall, c2_nr_cache = c2_sample
-            c2_nr_cache_new = c2_wall != self.last_c2_cache_wall_time
-
-            if c2_nr_cache_new:
-                if self.last_c2_nr_cache is not None:
-                    c2_nr_cache_delta = c2_nr_cache - self.last_c2_nr_cache
-                self.last_c2_nr_cache = c2_nr_cache
-                self.last_c2_cache_wall_time = c2_wall
-
-            if self.c2_file_size and self.c2_file_size > 0:
-                c2_retention = min(1.0, c2_nr_cache / float(self.c2_file_size))
-
-            if parent_max and parent_max > 0:
-                c2_parent_cache_ratio = c2_nr_cache / float(parent_max)
-
-        # ---------- Derived cache signals ----------
-        c1_retention_low = (
-            c1_retention is not None
-            and c1_retention < self.conf.retention_low
-        )
-        c1_retention_healthy = (
-            c1_retention is not None
-            and c1_retention >= self.conf.retention_healthy
-        )
-        c1_cache_falling = (
-            c1_nr_cache_delta is not None
-            and c1_nr_cache_delta <= -self.conf.cache_drop_bytes
-        ) or (
-            c1_retention_delta is not None
-            and c1_retention_delta <= -self.conf.retention_drop
-        )
-        c2_cache_growing = (
-            c2_nr_cache_delta is not None
-            and c2_nr_cache_delta >= self.conf.cache_growth_bytes
-        )
-        c2_cache_dominant = (
-            c2_parent_cache_ratio is not None
-            and c2_parent_cache_ratio >= self.conf.noisy_parent_cache_threshold
-        )
-
-        # ---------- Client2 PSI ----------
-        total = self.cgroup.total()
-        psi_delta = max(0, total - self.last_total)
-        self.last_total = total
-        self.integral += psi_delta
-        psi_avg10 = self.cgroup.pressure()
-
-        return Sample(
-            wall_time=now,
-            parent_current=parent_current,
-            parent_max=parent_max,
-            parent_util=parent_util,
-            parent_max_event_delta=parent_max_event_delta,
-            parent_hot=parent_hot,
-            c1_p99=c1_p99,
-            c1_p99_new=c1_p99_new,
-            c1_nr_cache=c1_nr_cache,
-            c1_nr_cache_new=c1_nr_cache_new,
-            c1_nr_cache_delta=c1_nr_cache_delta,
-            c1_retention=c1_retention,
-            c1_retention_delta=c1_retention_delta,
-            c1_parent_cache_ratio=c1_parent_cache_ratio,
-            c2_nr_cache=c2_nr_cache,
-            c2_nr_cache_new=c2_nr_cache_new,
-            c2_nr_cache_delta=c2_nr_cache_delta,
-            c2_retention=c2_retention,
-            c2_parent_cache_ratio=c2_parent_cache_ratio,
-            c1_retention_low=c1_retention_low,
-            c1_retention_healthy=c1_retention_healthy,
-            c1_cache_falling=c1_cache_falling,
-            c2_cache_growing=c2_cache_growing,
-            c2_cache_dominant=c2_cache_dominant,
-            p99_bad=p99_bad,
-            p99_healthy=p99_healthy,
-            p99_slack=p99_slack,
-            c2_psi_avg10=psi_avg10,
-            c2_psi_total=total,
-            c2_psi_delta=psi_delta,
-            c2_psi_integral=self.integral,
-        )
-
-    def classify_fairness(self, s):
-        """Return True only when evidence points to cross-cgroup cache contention."""
-        victim_eviction = s.c1_retention_low or s.c1_cache_falling
-        noisy_neighbor_evidence = s.c2_cache_growing or s.c2_cache_dominant
-
-        # Require all three causal pieces:
-        #   shared memory scarcity + victim cache loss + noisy-neighbor cache use.
-        return s.parent_hot and victim_eviction and noisy_neighbor_evidence
-
-    def adjust_memory_low(self, s, fairness_active):
-        if not self.victim:
-            return "disabled"
-
-        # Only make a new decision when at least one live victim/noisy signal
-        # advanced. This prevents one stale p99/nr_cache row from causing
-        # repeated +32 MiB changes every controller tick.
-        fresh_decision = s.c1_p99_new or s.c1_nr_cache_new or s.c2_nr_cache_new
-        if not fresh_decision:
-            return "hold_stale"
-
-        low = self.victim.read_low()
-
-        # Fast path: protect victim only after contention + displacement are
-        # both established. p99 may already be bad, but residency loss itself
-        # is allowed to act as an early warning before latency fully degrades.
-        if fairness_active:
-            old, new = self.victim.adjust_low_bytes(self.conf.low_up)
-            self.low_grace_ticks = self.conf.low_interval
-            if new != old:
-                reasons = []
-                if s.p99_bad:
-                    reasons.append("p99_bad")
-                if s.c1_cache_falling:
-                    reasons.append("c1_nr_cache_falling")
-                if s.c1_retention_low:
-                    reasons.append("c1_retention_low")
-                if s.c2_cache_growing:
-                    reasons.append("c2_nr_cache_growing")
-                if s.c2_cache_dominant:
-                    reasons.append("c2_cache_share_high")
-                log(
-                    f'  adjust Client1 memory.low: {h(old)} -> {h(new)} '
-                    f'(+{h(self.conf.low_up)}; {",".join(reasons)})'
-                )
-                return "raise_low"
-            return "hold_low_ceiling"
-
-        # A latency spike without memory-contention/cache-displacement evidence
-        # is explicitly not blamed on page-cache unfairness.
-        if s.p99_bad:
-            log('  hold Client1 memory.low: p99 bad, but fairness gate is false')
-            return "hold_bad_p99_no_contention"
-
-        # Slack band: retain the current protection.
-        if s.p99_slack:
-            return "hold_slack"
-
-        # Relax protection only when the victim is healthy, the shared parent
-        # is not currently hot, and Client1's target-file cache has recovered.
-        can_relax = (
-            s.p99_healthy
-            and not s.parent_hot
-            and s.c1_retention_healthy
-            and not s.c1_cache_falling
-        )
-
-        if not can_relax:
-            return "hold_not_safe_to_relax"
-
-        if self.low_grace_ticks > 0:
-            self.low_grace_ticks -= 1
-            return "hold_low_grace"
-
-        old, new = self.victim.adjust_low_bytes(-self.conf.low_down)
-        self.low_grace_ticks = self.conf.low_interval
-        if new != old:
-            log(
-                f'  adjust Client1 memory.low: {h(old)} -> {h(new)} '
-                f'(-{h(self.conf.low_down)}; healthy + cache recovered)'
-            )
-            return "lower_low"
-        return "hold_low_floor"
-
-    def adjust_memory_high(self, s, fairness_active):
-        """Run upstream PSI policy, coordinating only the upward adjustment."""
-        log(
-            'c2_high=%s pressure=%f time_to_probe=%2d total=%d delta=%d integral=%d' %
-            (h(self.cgroup.read_limit()), s.c2_psi_avg10,
-             self.grace_ticks, s.c2_psi_total, s.c2_psi_delta, self.integral)
-        )
-
-        if self.integral > self.conf.pressure:
-            if fairness_active:
-                # Do not let C2 expand its high boundary while it is actively
-                # displacing the victim. Reset the accumulated PSI budget so a
-                # huge deferred upward jump does not occur later.
-                log('  suppress Client2 memory.high increase: fairness_active')
-                self.integral = 0
-                self.grace_ticks = self.conf.interval - 1
-                return "suppress_high_raise"
-
-            err = self.integral / self.conf.pressure
-            adj = (err / self.conf.coeff_backoff) ** 2
-            adj = min(adj * self.conf.max_backoff, self.conf.max_backoff)
-            self.adjust_high(adj)
-            self.grace_ticks = self.conf.interval - 1
-            return "raise_high"
-
-        if self.grace_ticks:
-            self.grace_ticks -= 1
-            return "hold_high_grace"
-
-        # Low PSI: preserve upstream's downward probe. This direction helps
-        # fairness, so it is allowed even if the fairness gate is active.
-        err = self.conf.pressure / max(self.integral, 1)
-        adj = (err / self.conf.coeff_probe) ** 2
-        adj = min(adj * self.conf.max_probe, self.conf.max_probe)
-        self.adjust_high(-adj)
-        self.grace_ticks = self.conf.interval - 1
-        return "lower_high"
-
-    def adjust_high(self, factor):
-        log(f'  adjust Client2 memory.high: {factor:+.6f}')
-        self.cgroup.scale_limit(factor)
-        self.integral = 0
-
-    def log_snapshot(self, s, fairness_active, low_action, high_action):
-        log(
-            'fairness parent=%s max_event+=%d '
-            'c1_p99=%s c1_nr=%s c1_ret=%s c1_d=%s '
-            'c2_nr=%s c2_parent_share=%s c2_d=%s '
-            'gate=%s low_action=%s high_action=%s' % (
-                pct(s.parent_util),
-                s.parent_max_event_delta,
-                'n/a' if s.c1_p99 is None else f'{s.c1_p99:.1f}us',
-                h(s.c1_nr_cache),
-                pct(s.c1_retention),
-                h(s.c1_nr_cache_delta),
-                h(s.c2_nr_cache),
-                pct(s.c2_parent_cache_ratio),
-                h(s.c2_nr_cache_delta),
-                fairness_active,
-                low_action,
-                high_action,
-            )
-        )
-
-    def write_controller_csv(self, s, fairness_active, low_action, high_action):
-        if not self.conf.controller_csv:
-            return
-        with open(self.conf.controller_csv, 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                s.wall_time,
-                s.parent_current, s.parent_max, s.parent_util,
-                s.parent_max_event_delta, int(s.parent_hot),
-                s.c1_p99, int(s.p99_bad), int(s.p99_healthy), int(s.p99_slack),
-                s.c1_nr_cache, s.c1_nr_cache_delta, s.c1_retention,
-                s.c1_retention_delta, s.c1_parent_cache_ratio,
-                int(s.c1_retention_low), int(s.c1_retention_healthy), int(s.c1_cache_falling),
-                s.c2_nr_cache, s.c2_nr_cache_delta, s.c2_retention,
-                s.c2_parent_cache_ratio, int(s.c2_cache_growing), int(s.c2_cache_dominant),
-                s.c2_psi_avg10, s.c2_psi_delta, s.c2_psi_integral,
-                int(fairness_active),
-                self.victim.read_low() if self.victim else None,
-                self.cgroup.read_limit(),
-                low_action, high_action,
-            ])
+                samples = {k: sample(p) for k, p in path_of.items()}
+                parent_usage = number(parent, 'memory.current')
+                old_lows = {k: number(p, 'memory.low') for k, p in path_of.items()}
+                old_highs = {k: (cap if (v := number(p, 'memory.high', allow_max=True)) is None else v)
+                             for k, p in path_of.items()}
+            except (OSError, KeyError, ValueError, StopIteration) as exc:
+                print(f'Sample failed; holding limits: {exc}', file=sys.stderr)
+                old_samples = None
+                continue
+            now = time.monotonic()
+            dt = max(now - old_t, 1e-6)
+            old_t = now
+            if old_samples is None:
+                old_samples = samples
+                continue
+            diffs = {k: changes(samples[k], old_samples[k]) for k in names}
+            old_samples = samples
+            lows, highs, protections, quiets, details = decide(
+                a, cap, parent_usage, samples, diffs, protections, quiets,
+                old_highs, dt)
+            # Update low boundaries before high thresholds to establish
+            # protection before reclaiming from bursty clients.
+            for k, p in path_of.items():
+                if lows[k] != aligned(old_lows[k]) and not a.dry_run:
+                    (p / 'memory.low').write_text(str(lows[k]))
+            for k, p in path_of.items():
+                if highs[k] != aligned(old_highs[k]) and not a.dry_run:
+                    (p / 'memory.high').write_text(str(highs[k]))
+            if writer:
+                for k in names:
+                    s, d = samples[k], diffs[k]
+                    writer.writerow(dict(
+                        time=time.time(), dt=dt, tenant=k,
+                        role='victim' if k in details['victims'] else 'bursty',
+                        usage=s.usage, usage_delta=d.usage_delta,
+                        file_cache=s.file_cache, cache_delta=d.cache_delta,
+                        refault_bytes=d.refault_bytes, pgsteal_bytes=d.pgsteal_bytes,
+                        high_events_delta=d.high_delta, psi_delta_us=d.psi_delta_us,
+                        physical_read_bytes=d.rbytes_delta,
+                        protection_target=aligned(protections[k]),
+                        low_before=old_lows[k], low_target=lows[k],
+                        low_after=number(path_of[k], 'memory.low'),
+                        high_before=old_highs[k], high_target=highs[k],
+                        high_after=(cap if (v := number(path_of[k], 'memory.high', allow_max=True)) is None else v),
+                        high_ceiling=details['ceilings'][k],
+                        victim_usage_sum=details['victim_usage'], fair_share=fair,
+                        growth_budget=details['growths'][k],
+                        low_reason=details['low_reasons'][k],
+                        high_reason=details['high_reasons'][k], dry_run=int(a.dry_run)))
+            print(' | '.join(f'{k}: {"victim" if k in details["victims"] else "bursty"}'
+                             f' usage={samples[k].usage/MIB:.0f}MiB'
+                             f' low={lows[k]/MIB:.0f}MiB high={highs[k]/MIB:.0f}MiB'
+                             for k in names), flush=True)
+            ticks += 1
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if log:
+            log.close()
 
 
-def validate_conf(parser, conf):
-    if not conf.victim_cgpath:
-        return
-
-    required = {
-        '--parent-cgpath': conf.parent_cgpath,
-        '--victim-p99': conf.victim_p99,
-        '--victim-nr-cache': conf.victim_nr_cache,
-        '--noisy-nr-cache': conf.noisy_nr_cache,
-    }
-    missing = [name for name, value in required.items() if not value]
-    if missing:
-        parser.error(
-            'Client1 fairness control requires: ' + ', '.join(missing)
-        )
-
-    if resolve_file_size(conf.victim_file, conf.victim_file_size) is None:
-        parser.error(
-            'Client1 fairness control requires --victim-file or '
-            '--victim-file-size so nr_cache can be converted to a retention ratio'
-        )
-
-    if not (0.0 < conf.retention_low <= conf.retention_healthy <= 1.0):
-        parser.error(
-            'Require 0 < --retention-low <= --retention-healthy <= 1'
-        )
-
-    if not (0.0 < conf.parent_util_threshold <= 1.0):
-        parser.error('--parent-util-threshold must be in (0, 1]')
-
-
-parser = argparse.ArgumentParser(
-    description="""
-Page-cache fairness Senpai (fork of facebookincubator/senpai).
-
-Client2 (positional cgpath):
-  Dynamically adjusts memory.high from PSI using upstream Senpai's control law.
-  An upward memory.high adjustment is suppressed while the fairness gate says
-  Client2 is displacing Client1 under a saturated shared parent.
-
-Client1 (--victim-cgpath):
-  Dynamically adjusts memory.low using parent memory utilization,
-  memory.events.local:max, live p99, and live cachestat nr_cache samples.
-
-Fairness gate:
-  parent_hot
-    AND (Client1 retention low OR Client1 nr_cache falling)
-    AND (Client2 nr_cache growing OR Client2 nr_cache / parent memory.max high)
-
-Client1 memory.low:
-  fairness gate active     -> +LOW_UP (default 32 MiB)
-  p99 slack / uncertain    -> hold
-  healthy + parent cool + Client1 retention recovered for grace period
-                           -> -LOW_DOWN (default 16 MiB)
-
-The live nr_cache files are expected to contain one line:
-  wall_time,nr_cache_bytes
-where nr_cache_bytes is cachestat nr_cache * page_size for the target file.
-""",
-    formatter_class=argparse.RawDescriptionHelpFormatter,
-)
-
-# Client2 / upstream Senpai knobs
-parser.add_argument('cgpath', type=str,
-                    help='Client2 (noisy) cgroup path — memory.high from PSI')
-parser.add_argument('--min-size', type=int, default=100 << 20)
-parser.add_argument('--max-size', type=int, default=100 << 30)
-parser.add_argument('--interval', type=int, default=6)
-parser.add_argument('--pressure', type=int, default=10 * 1000)
-parser.add_argument('--max-probe', type=float, default=0.01)
-parser.add_argument('--max-backoff', type=float, default=1.0)
-parser.add_argument('--coeff-probe', type=int, default=10)
-parser.add_argument('--coeff-backoff', type=int, default=20)
-
-# Client1 fairness / memory.low controller
-parser.add_argument('--victim-cgpath', type=str, default=None,
-                    help='Client1 (victim) cgroup path — memory.low actuator')
-parser.add_argument('--parent-cgpath', type=str, default=None,
-                    help='Shared parent cgroup, e.g. /sys/fs/cgroup/clients')
-
-parser.add_argument('--victim-p99', '--victim-p99-csv', dest='victim_p99',
-                    default=None,
-                    help='One-line live p99 file: wall_time,p99_us')
-parser.add_argument('--victim-nr-cache', '--victim-resident', dest='victim_nr_cache',
-                    default=None,
-                    help='One-line Client1 cachestat nr_cache file: wall_time,bytes')
-parser.add_argument('--noisy-nr-cache', default=None,
-                    help='One-line Client2 cachestat nr_cache file: wall_time,bytes')
-
-parser.add_argument('--victim-file', default=None,
-                    help='Client1 target file; used only to get file size')
-parser.add_argument('--noisy-file', default=None,
-                    help='Client2 target file; used only to get file size')
-parser.add_argument('--victim-file-size', type=int, default=None,
-                    help='Client1 target-file size in bytes; overrides --victim-file stat')
-parser.add_argument('--noisy-file-size', type=int, default=None,
-                    help='Client2 target-file size in bytes; overrides --noisy-file stat')
-
-parser.add_argument('--parent-util-threshold', type=float, default=0.90,
-                    help='Parent memory.current/memory.max threshold for contention '
-                         '(default: 0.90)')
-parser.add_argument('--retention-low', type=float, default=0.85,
-                    help='Client1 nr_cache/file_size ratio considered low '
-                         '(default: 0.85)')
-parser.add_argument('--retention-healthy', type=float, default=0.95,
-                    help='Client1 nr_cache/file_size ratio required before relaxing '
-                         'memory.low (default: 0.95)')
-parser.add_argument('--retention-drop', type=float, default=0.03,
-                    help='One-sample Client1 retention-ratio drop considered eviction '
-                         '(default: 0.03)')
-parser.add_argument('--cache-drop-bytes', type=int, default=16 << 20,
-                    help='Client1 nr_cache drop considered eviction (default: 16 MiB)')
-parser.add_argument('--cache-growth-bytes', type=int, default=16 << 20,
-                    help='Client2 nr_cache growth considered noisy growth '
-                         '(default: 16 MiB)')
-parser.add_argument('--noisy-parent-cache-threshold', type=float, default=0.50,
-                    help='Client2 nr_cache / parent memory.max ratio considered large '
-                         '(default: 0.50)')
-parser.add_argument('--sample-max-age', type=float, default=3.0,
-                    help='Ignore live p99/nr_cache samples older than this many seconds '
-                         '(default: 3.0)')
-
-parser.add_argument('--p99-target', type=float, default=3.0,
-                    help='Client1 p99 SLO in microseconds (default: 3.0)')
-parser.add_argument('--p99-delta', type=float, default=3.0,
-                    help='Slack above p99 target; p99 > target+delta is bad '
-                         '(default: 3.0 us)')
-
-parser.add_argument('--low-min-size', type=int, default=0,
-                    help='Floor for Client1 memory.low in bytes')
-parser.add_argument('--low-max-size', type=int, default=2 << 30,
-                    help='Ceiling for Client1 memory.low in bytes (default: 2 GiB)')
-parser.add_argument('--low-up', type=int, default=32 << 20,
-                    help='Bytes to add to memory.low on fairness activation '
-                         '(default: 32 MiB)')
-parser.add_argument('--low-down', type=int, default=16 << 20,
-                    help='Bytes to subtract when safely relaxing protection '
-                         '(default: 16 MiB)')
-parser.add_argument('--low-interval', type=int, default=6,
-                    help='Healthy samples required between memory.low downward probes '
-                         '(default: 6)')
-
-parser.add_argument('--controller-csv', default=None,
-                    help='Optional CSV path for per-tick controller diagnostics')
-
-conf = parser.parse_args()
-validate_conf(parser, conf)
-senpai = Senpai(conf)
-senpai.run()
+if __name__ == '__main__':
+    main()
