@@ -157,7 +157,6 @@ static struct {
     .senpai_max_size    = 2L << 30,
     .senpai_interval    = 6,
     .senpai_pressure    = 10000,
-    .senpai_p99_target  = 3.0,
     .senpai_low_min_size = 0,
     .senpai_low_max_size = 2L << 30,
 };
@@ -1426,7 +1425,7 @@ static void stop_senpai_high(pid_t pid) {
 /* must match senpai.py --parent-util-threshold default */
 #define SENPAI_PARENT_UTIL_THRESHOLD 0.90
 
-/* senpai.py: Client2 memory.high from PSI, Client1 memory.low from live p99. */
+/* senpai.py: memory.low from refaults, memory.high from remaining capacity. */
 static pid_t start_senpai(const char *c2_cgroup_name,
                           const char *c1_cgroup_name,
                           const char *c2_target_file,
@@ -1480,7 +1479,7 @@ static pid_t start_senpai(const char *c2_cgroup_name,
              " --victim-nr-cache '%s' --noisy-nr-cache '%s'"
              " --victim-file '%s' --noisy-file '%s'"
              " --parent-cgpath '%s' --parent-util-threshold %.3f"
-             " --p99-target %.3f --low-min-size %ld --low-max-size %ld"
+             " --low-min-size %ld --low-max-size %ld"
              " --controller-csv '%s' >> '%s' 2>&1",
              opt.senpai_script, cg_path,
              opt.senpai_min_size, opt.senpai_max_size,
@@ -1489,7 +1488,6 @@ static pid_t start_senpai(const char *c2_cgroup_name,
              c1_target_file, c2_target_file,
              parent_path[0] ? parent_path : "",
              SENPAI_PARENT_UTIL_THRESHOLD,
-             opt.senpai_p99_target,
              opt.senpai_low_min_size, opt.senpai_low_max_size,
              controller_csv, log_path);
     if (n < 0 || (size_t)n >= sizeof(cmd)) {
@@ -2145,8 +2143,8 @@ static void usage(const char *argv0) {
 "      --clat-log           1 s fio clat histograms for client1+client2 (default on)\n"
 "      --no-clat-log        Disable clat histogram logging (no 1 Hz p99 series)\n"
 "      --no-timeseries      Disable 1 Hz timeseries/ CSVs\n"
-"      --senpai             After phase 0: senpai.py on Client2 memory.high (PSI)\n"
-"                           + Client1 memory.low (p99; default target 3 us)\n"
+"      --senpai             After phase 0: senpai.py sets memory.low from\n"
+"                           refaults and memory.high from remaining capacity\n"
 "      --senpai-high        After phase 0: senpai_high.py on Client2 memory.high\n"
 "                           (upstream Senpai; no Client1 memory.low)\n"
 "      --senpai-script PATH Senpai script (default: ./senpai.py with --senpai,\n"
@@ -2157,7 +2155,6 @@ static void usage(const char *argv0) {
 "      --senpai-max-size N  memory.high ceiling (default: 2G)\n"
 "      --senpai-interval N  Probe interval seconds (default: 6)\n"
 "      --senpai-pressure N  Memory-stall budget in µs (default: 10000)\n"
-"      --senpai-p99-target N  Client1 p99 SLO in µs (default: 3.0)\n"
 "      --senpai-low-min N   Client1 memory.low floor (bytes / K/M/G)\n"
 "      --senpai-low-max N   Client1 memory.low ceiling (default: 2G)\n"
 "  -m, --mode MODE          cached | direct | both (default: both)\n"
@@ -2216,8 +2213,6 @@ int main(int argc, char **argv) {
             opt.senpai_interval = atoi(argv[++i]);
         else if (!strcmp(a, "--senpai-pressure") && i + 1 < argc)
             opt.senpai_pressure = atoi(argv[++i]);
-        else if (!strcmp(a, "--senpai-p99-target") && i + 1 < argc)
-            opt.senpai_p99_target = atof(argv[++i]);
         else if (!strcmp(a, "--senpai-low-min") && i + 1 < argc)
             opt.senpai_low_min_size = parse_byte_size(argv[++i]);
         else if (!strcmp(a, "--senpai-low-max") && i + 1 < argc)

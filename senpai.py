@@ -3,8 +3,9 @@
 
 At each tick, clients with memory.current < capacity/number_of_clients are
 classified as victims; the others are bursty. This is a *heuristic role*, not a
-proof of latency sensitivity. Victims receive refault-proportional memory.low
-protection; bursty clients can borrow remaining space through memory.high.
+proof of latency sensitivity. Refault-driven memory.low targets persist for all
+tenants. Bursty clients share remaining capacity through demand-weighted
+memory.high ceilings, with fair-share baselines when capacity permits.
 
 No benchmark file size, IOPS, or block size is used. The two-tenant harness
 interface is supported, and additional clients can be passed with
@@ -156,13 +157,31 @@ def decide(args, capacity, parent_usage, samples, diffs, protections,
         lows[k] = grant
         remaining = max(0, remaining - grant)
 
-    # For each bursty tenant, subtract all victim ACTUAL usage. With multiple
-    # bursty tenants, account for other bursty tenants' current footprints too
-    # to avoid giving every bursty client an identical full shared allowance.
+    # Demand-weighted allocation for bursty tenants (Step 4).
+    # Victims are charged at their observed usage, not at memory.low.
+    # Keep every bursty tenant's fair share when it fits in the remaining
+    # budget, then distribute extra proportionally to observed demand.
+    # If the fair-share baselines do NOT fit, distribute the shortfall
+    # proportionally instead of creating impossible aggregate ceilings.
+    bursty_budget = max(0.0, budget - victim_usage)
+    weights = {k: max(float(samples[k].usage), fair)
+               + args.gain_up * diffs[k].refault_bytes for k in bursty}
+    weight_total = sum(weights.values())
+    if bursty and weight_total <= 0:
+        weights = {k: 1.0 for k in bursty}
+        weight_total = float(len(bursty))
+    fair_total = len(bursty) * fair
+    extra_budget = max(0.0, bursty_budget - fair_total)
+    shortage = bool(bursty and bursty_budget < fair_total)
     ceilings = {}
     for k in names:
-        others_bursty = sum(samples[j].usage for j in bursty if j != k)
-        ceilings[k] = aligned(max(0, budget - victim_usage - others_bursty))
+        if k in victims:
+            # A victim's memory.high is reset separately (unthrottled).
+            ceilings[k] = aligned(budget)
+        elif shortage:
+            ceilings[k] = aligned(bursty_budget * weights[k] / weight_total)
+        else:
+            ceilings[k] = aligned(fair + extra_budget * weights[k] / weight_total)
 
     highs, growths, high_reasons = {}, {}, {}
     for k in names:
@@ -195,7 +214,9 @@ def decide(args, capacity, parent_usage, samples, diffs, protections,
         growths[k], high_reasons[k] = growth, why
 
     details = dict(fair_share=fair, victims=victims, bursty=bursty,
-                   victim_usage=victim_usage, ceilings=ceilings,
+                   victim_usage=victim_usage, bursty_budget=bursty_budget,
+                   demand_weights=weights, extra_budget=extra_budget,
+                   fair_share_shortage=int(shortage), ceilings=ceilings,
                    growths=growths, low_reasons=reasons,
                    high_reasons=high_reasons)
     return lows, highs, next_p, next_q, details
@@ -286,7 +307,8 @@ def main(argv=None):
                    'high_events_delta', 'psi_delta_us', 'physical_read_bytes',
                    'protection_target', 'low_before', 'low_target', 'low_after',
                    'high_before', 'high_target', 'high_after', 'high_ceiling',
-                   'victim_usage_sum', 'fair_share', 'growth_budget',
+                   'victim_usage_sum', 'fair_share', 'bursty_budget',
+                   'demand_weight', 'extra_budget', 'fair_share_shortage', 'growth_budget',
                    'low_reason', 'high_reason', 'dry_run']
         writer = csv.DictWriter(log, fieldnames=columns)
         if new_file:
@@ -345,6 +367,10 @@ def main(argv=None):
                         high_after=(cap if (v := number(path_of[k], 'memory.high', allow_max=True)) is None else v),
                         high_ceiling=details['ceilings'][k],
                         victim_usage_sum=details['victim_usage'], fair_share=fair,
+                        bursty_budget=details['bursty_budget'],
+                        demand_weight=details['demand_weights'].get(k, 0),
+                        extra_budget=details['extra_budget'],
+                        fair_share_shortage=details['fair_share_shortage'],
                         growth_budget=details['growths'][k],
                         low_reason=details['low_reasons'][k],
                         high_reason=details['high_reasons'][k], dry_run=int(a.dry_run)))

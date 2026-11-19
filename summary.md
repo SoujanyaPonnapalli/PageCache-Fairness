@@ -375,7 +375,6 @@ read vs write B; plot B intensity (X) vs A p99 (Y).
       --senpai-script PATH Script path             (default: ./senpai.py or ./senpai_high.py)
       --senpai-client NAME Client2 section         (default: client2_noisy)
       --senpai-victim NAME Client1 section         (default: client1_steady; --senpai only)
-      --senpai-p99-target N  Client1 p99 SLO in µs (default: 3.0; --senpai only)
       --senpai-low-min N   Client1 memory.low floor (--senpai only)
       --senpai-low-max N   Client1 memory.low ceiling (default: 2G; --senpai only)
       --senpai-min-size N  memory.high floor       (default: 100M)
@@ -558,10 +557,9 @@ Disable recording if needed:
 
 ### Fairness Senpai (`--senpai`)
 
-`--senpai` forks `senpai.py` after phase 0. Client2 `memory.high` still follows
-PSI, and upward moves are suppressed while Client2 is displacing Client1.
-Client1 `memory.low` moves from the shared parent's fullness, live cache
-retention, and Client1 p99. Stdout is `senpai/senpai_<client>_<mode>.log`;
+`--senpai` forks `senpai.py` after phase 0. `memory.low` follows refaults, and
+`memory.high` follows the capacity left after victim usage. Stdout is
+`senpai/senpai_<client>_<mode>.log`;
 per-tick decisions are `senpai/controller_<mode>.csv`.
 
 ```bash
