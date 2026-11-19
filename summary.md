@@ -374,12 +374,11 @@ read vs write B; plot B intensity (X) vs A p99 (Y).
       --clat-log           1 s fio clat histograms for client1+client2 (default on)
       --no-clat-log        Disable clat histogram logs (no per-second p99 series)
       --no-timeseries      Disable timeseries/ CSVs
-      --senpai             After phase 0, run senpai.py (memory.high + victim memory.low)
+      --senpai             After phase 0, run senpai.py (fair-share roles, refault memory.low)
       --senpai-high        After phase 0, run senpai_high.py on Client2 memory.high
       --senpai-script PATH Script path             (default: ./senpai.py or ./senpai_high.py)
-      --senpai-client NAME Noisy neighbor          (repeatable; default client2_noisy, else *noisy*)
-      --senpai-victim NAME Good tenant             (repeatable; default client1_steady, else the rest)
-      --senpai-p99-target N  Client1 p99 SLO in µs (default: 3.0; --senpai only)
+      --senpai-client NAME Cgroup to enroll        (repeatable; default client2_noisy, else *noisy*)
+      --senpai-victim NAME Cgroup to enroll        (repeatable; default client1_steady, else the rest)
       --senpai-low-min N   Client1 memory.low floor (--senpai only)
       --senpai-low-max N   Client1 memory.low ceiling (default: 2G; --senpai only)
       --senpai-min-size N  memory.high floor       (default: 100M)
@@ -562,11 +561,10 @@ Disable recording if needed:
 
 ### Fairness Senpai (`--senpai`)
 
-`--senpai` forks `senpai.py` after phase 0. Each noisy neighbor's `memory.high`
-follows PSI, and an upward move is suppressed only while that neighbor is
-displacing a good tenant. Each good tenant's `memory.low` moves from the shared
-parent's fullness, that tenant's live cache retention, and that tenant's p99.
-On `dual` the two roles are still `client2_noisy` and `client1_steady`. Stdout
+`--senpai` forks `senpai.py` after phase 0. Each tick classifies every enrolled
+cgroup by fair share. `memory.low` follows refaults, and `memory.high` shares
+the capacity left after victim usage. On `dual` the enrolled cgroups are still
+`client2_noisy` and `client1_steady`; on `multi` they are every section. Stdout
 is `senpai/senpai_<noisy>_<mode>.log`; per-tick decisions are
 `senpai/controller_<mode>.csv` (one row per tenant).
 

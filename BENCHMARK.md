@@ -256,7 +256,7 @@ latency percentiles and cgroup memory, PSI, and `io.stat`. The file layout is in
 
 Both modes start after phase 0 and require `--cgroup-config`. Pass only one of them.
 
-- `--senpai` runs `senpai.py`: Tenant B's `memory.high` from PSI, and Tenant A's `memory.low` from live p99 and cache retention.
+- `--senpai` runs `senpai.py`: `memory.low` from refaults, and `memory.high` from remaining parent capacity.
 - `--senpai-high` runs `senpai_high.py`: [upstream Senpai](https://github.com/facebookincubator/senpai) on Tenant B's `memory.high` only.
 
 ```bash
@@ -264,14 +264,14 @@ sudo ./benchmark -v --drop-once --senpai --cgroup-config cgroup_shared.ini -m ca
 sudo ./benchmark -v --drop-once --senpai-high --cgroup-config cgroup_shared.ini -m cached -o results/senpai_high dual
 ```
 
-Stdout goes to `<output>/senpai/senpai_<noisy>_<mode>.log`. `--senpai` also writes `<output>/senpai/controller_<mode>.csv`. `--senpai-client` and `--senpai-victim` are repeatable. On `dual` the defaults stay `client2_noisy` and `client1_steady`.
+Stdout goes to `<output>/senpai/senpai_<noisy>_<mode>.log`. `--senpai` also writes `<output>/senpai/controller_<mode>.csv`. `--senpai-client` and `--senpai-victim` enroll cgroups; victim and bursty are inferred each tick. On `dual` the defaults stay `client2_noisy` and `client1_steady`.
 
 ## Three tenants
 
-`fairness_configs_multi.ini` runs two 256 MiB good tenants and one 32 GiB noisy neighbor. `client3_noisy` reads the existing `test_file_client2_noisy_32G` (`filename` in the ini) instead of allocating a second 32G file.
+`fairness_configs_multi.ini` runs two 256 MiB good tenants and one 32 GiB noisy neighbor. `client3_noisy` reads the existing `test_file_client2_noisy_32G` (`filename` in the ini) instead of allocating a second 32G file. `--senpai` enrolls all three; `client2_good` is passed as an extra `--client-cgpath`.
 
 ```bash
-sudo ./benchmark -v --drop-once -c fairness_configs_multi.ini --cgroup-config cgroup_shared_multi.ini -m cached -o results/multi multi
+sudo ./benchmark -v --drop-once --senpai -c fairness_configs_multi.ini --cgroup-config cgroup_shared_multi.ini -m cached -o results/multi multi
 ```
 
 ## 📈 Understanding Results
@@ -549,11 +549,12 @@ sudo ./benchmark -v --drop-once --senpai-high --cgroup-config cgroup_shared.ini 
 sudo ./benchmark -c fairness_configs.ini -o results/ client1_steady
 ```
 
-`--senpai` runs `senpai.py` (Client2 `memory.high` and Client1 `memory.low`).
-`--senpai-high` runs `senpai_high.py` (Client2 `memory.high` only). Shared knobs:
-`--senpai-script`, `--senpai-client`, `--senpai-min-size`, `--senpai-max-size`,
-`--senpai-interval`, `--senpai-pressure`. `--senpai` also takes `--senpai-victim`,
-`--senpai-p99-target`, `--senpai-low-min`, and `--senpai-low-max`. Timeseries:
+`--senpai` runs `senpai.py` on every enrolled cgroup and infers victim and bursty
+each tick. `--senpai-high` runs `senpai_high.py` (Client2 `memory.high` only).
+Shared knobs: `--senpai-script`, `--senpai-client`, `--senpai-min-size`,
+`--senpai-max-size`, `--senpai-interval`, `--senpai-pressure`. `--senpai` also
+takes repeatable `--senpai-victim`, plus `--senpai-low-min` and `--senpai-low-max`.
+`multi` enrolls every section in the config. Timeseries:
 `--no-timeseries`,
 `--no-clat-log` (`--clat-log` writes 1 s histograms, not per-IO samples). See
 [summary.md — 1 Hz timeseries](summary.md#14-1-hz-timeseries).

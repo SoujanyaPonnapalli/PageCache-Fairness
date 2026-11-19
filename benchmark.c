@@ -128,17 +128,16 @@ static struct {
     bool        use_senpai;        /* fork senpai.py (memory.high + victim memory.low) */
     bool        senpai_script_set; /* user passed --senpai-script */
     const char *senpai_script;     /* senpai_high.py or senpai.py */
-    const char *senpai_clients[MAX_CLIENTS]; /* noisy neighbors; empty = infer */
+    const char *senpai_clients[MAX_CLIENTS]; /* enrolled noisy cgroups; empty = infer */
     int         n_senpai_clients;
     bool        senpai_client_set;
-    const char *senpai_victims[MAX_CLIENTS]; /* good tenants; empty = infer */
+    const char *senpai_victims[MAX_CLIENTS]; /* enrolled good cgroups; empty = infer */
     int         n_senpai_victims;
     bool        senpai_victim_set;
     long        senpai_min_size;
     long        senpai_max_size;
     int         senpai_interval;
     int         senpai_pressure;
-    double      senpai_p99_target;   /* Client1 p99 SLO in µs */
     long        senpai_low_min_size;
     long        senpai_low_max_size;
 } opt = {
@@ -165,7 +164,6 @@ static struct {
     .senpai_max_size    = 2L << 30,
     .senpai_interval    = 6,
     .senpai_pressure    = 10000,
-    .senpai_p99_target  = 3.0,
     .senpai_low_min_size = 0,
     .senpai_low_max_size = 2L << 30,
 };
@@ -1433,9 +1431,6 @@ static void stop_senpai_high(pid_t pid) {
     waitpid(pid, NULL, 0);
 }
 
-/* must match senpai.py --parent-util-threshold default */
-#define SENPAI_PARENT_UTIL_THRESHOLD 0.90
-
 typedef struct {
     const char *name;
     char cgroup_rel[MAX_STR];
@@ -1545,8 +1540,8 @@ static void cgroup_parent_path(const char *rel, char *out, size_t n) {
     snprintf(out, n, "%s", full);
 }
 
-/* senpai.py: each noisy neighbor's memory.high from PSI, each good tenant's
- * memory.low from that tenant's live p99 and cache retention. */
+/* senpai.py infers victim and bursty each tick. --senpai-client and
+ * --senpai-victim only choose which cgroups are enrolled. */
 static pid_t start_senpai(const SenpaiTenant *noisies, int n_noisy,
                           const SenpaiTenant *victims, int n_victim,
                           const char *mode) {
@@ -1561,26 +1556,30 @@ static pid_t start_senpai(const SenpaiTenant *noisies, int n_noisy,
              opt.senpai_script, strerror(errno));
         return -1;
     }
-    if (!opt.use_timeseries)
-        INFO("warning: --no-timeseries disables the nr_cache feeds senpai.py needs");
 
     char parent[MAX_CMD], other[MAX_CMD];
     cgroup_parent_path(victims[0].cgroup_rel, parent, sizeof(parent));
-    for (int i = 1; i < n_victim; i++) {
+    for (int i = 0; i < n_victim; i++) {
         cgroup_parent_path(victims[i].cgroup_rel, other, sizeof(other));
         if (strcmp(parent, other) != 0) {
-            INFO("warning: --senpai good tenants do not share one parent cgroup");
+            INFO("warning: --senpai tenants do not share one parent cgroup");
+            return -1;
+        }
+    }
+    for (int i = 0; i < n_noisy; i++) {
+        cgroup_parent_path(noisies[i].cgroup_rel, other, sizeof(other));
+        if (strcmp(parent, other) != 0) {
+            INFO("warning: --senpai tenants do not share one parent cgroup");
             return -1;
         }
     }
 
-    char log_dir[MAX_CMD], log_path[MAX_CMD], controller_csv[MAX_CMD], ts_dir[MAX_CMD];
+    char log_dir[MAX_CMD], log_path[MAX_CMD], controller_csv[MAX_CMD];
     ensure_subdir(opt.output_dir, "senpai", log_dir, sizeof(log_dir));
     snprintf(log_path, sizeof(log_path), "%s/senpai_%s_%s.log",
              log_dir, noisies[0].name, mode);
     snprintf(controller_csv, sizeof(controller_csv), "%s/controller_%s.csv",
              log_dir, mode);
-    snprintf(ts_dir, sizeof(ts_dir), "%s/timeseries", opt.output_dir);
 
     char arena[1 << 16];
     size_t used = 0;
@@ -1598,9 +1597,9 @@ static pid_t start_senpai(const SenpaiTenant *noisies, int n_noisy,
 
     PUSH("python3");
     PUSH(opt.senpai_script);
-    char first_cg[MAX_CMD];
-    snprintf(first_cg, sizeof(first_cg), "%s/%s", CGROUP_ROOT, noisies[0].cgroup_rel);
-    PUSH(first_cg);
+    char path[MAX_CMD];
+    snprintf(path, sizeof(path), "%s/%s", CGROUP_ROOT, noisies[0].cgroup_rel);
+    PUSH(path);
     PUSH("--min-size");
     snprintf(scratch, sizeof(scratch), "%ld", opt.senpai_min_size);
     PUSH(scratch);
@@ -1613,42 +1612,21 @@ static pid_t start_senpai(const SenpaiTenant *noisies, int n_noisy,
     PUSH("--pressure");
     snprintf(scratch, sizeof(scratch), "%d", opt.senpai_pressure);
     PUSH(scratch);
-
-    for (int i = 0; i < n_victim; i++) {
-        char path[MAX_CMD];
+    snprintf(path, sizeof(path), "%s/%s", CGROUP_ROOT, victims[0].cgroup_rel);
+    PUSH("--victim-cgpath");
+    PUSH(path);
+    for (int i = 1; i < n_victim; i++) {
         snprintf(path, sizeof(path), "%s/%s", CGROUP_ROOT, victims[i].cgroup_rel);
-        PUSH("--victim-cgpath");
+        PUSH("--client-cgpath");
         PUSH(path);
-        snprintf(path, sizeof(path), "%s/%s_p99.live", ts_dir, victims[i].name);
-        PUSH("--victim-p99");
-        PUSH(path);
-        live_nr_cache_path(path, sizeof(path), ts_dir, victims[i].name);
-        PUSH("--victim-nr-cache");
-        PUSH(path);
-        PUSH("--victim-file");
-        PUSH(victims[i].target_file);
     }
-    for (int i = 0; i < n_noisy; i++) {
-        char path[MAX_CMD];
-        if (i > 0) {
-            snprintf(path, sizeof(path), "%s/%s", CGROUP_ROOT, noisies[i].cgroup_rel);
-            PUSH("--noisy-cgpath");
-            PUSH(path);
-        }
-        live_nr_cache_path(path, sizeof(path), ts_dir, noisies[i].name);
-        PUSH("--noisy-nr-cache");
+    for (int i = 1; i < n_noisy; i++) {
+        snprintf(path, sizeof(path), "%s/%s", CGROUP_ROOT, noisies[i].cgroup_rel);
+        PUSH("--client-cgpath");
         PUSH(path);
-        PUSH("--noisy-file");
-        PUSH(noisies[i].target_file);
     }
     PUSH("--parent-cgpath");
     PUSH(parent);
-    PUSH("--parent-util-threshold");
-    snprintf(scratch, sizeof(scratch), "%.3f", SENPAI_PARENT_UTIL_THRESHOLD);
-    PUSH(scratch);
-    PUSH("--p99-target");
-    snprintf(scratch, sizeof(scratch), "%.3f", opt.senpai_p99_target);
-    PUSH(scratch);
     PUSH("--low-min-size");
     snprintf(scratch, sizeof(scratch), "%ld", opt.senpai_low_min_size);
     PUSH(scratch);
@@ -1675,8 +1653,8 @@ static pid_t start_senpai(const SenpaiTenant *noisies, int n_noisy,
         INFO("warning: fork senpai: %s", strerror(errno));
         return -1;
     }
-    INFO("senpai armed after phase 0: %d noisy memory.high, %d good-tenant memory.low -> %s",
-         n_noisy, n_victim, log_path);
+    INFO("senpai armed after phase 0: %d tenants, roles inferred each tick -> %s",
+         n_noisy + n_victim, log_path);
     return pid;
 }
 
@@ -2320,21 +2298,24 @@ static void usage(const char *argv0) {
 "      --clat-log           1 s fio clat histograms for client1+client2 (default on)\n"
 "      --no-clat-log        Disable clat histogram logging (no 1 Hz p99 series)\n"
 "      --no-timeseries      Disable 1 Hz timeseries/ CSVs\n"
-"      --senpai             After phase 0: senpai.py on Client2 memory.high (PSI)\n"
-"                           + Client1 memory.low (p99; default target 3 us)\n"
+"      --senpai             After phase 0: senpai.py on every enrolled cgroup.\n"
+"                           Victim/bursty is inferred each tick. memory.low\n"
+"                           follows refaults; memory.high shares what remains.\n"
 "      --senpai-high        After phase 0: senpai_high.py on Client2 memory.high\n"
 "                           (upstream Senpai; no Client1 memory.low)\n"
 "      --senpai-script PATH Senpai script (default: ./senpai.py with --senpai,\n"
 "                           ./senpai_high.py with --senpai-high)\n"
-"      --senpai-client NAME Noisy neighbor (repeatable). Default: client2_noisy\n"
-"                           if it is in the run, else every name containing \"noisy\"\n"
-"      --senpai-victim NAME Good tenant (repeatable). Default: client1_steady if\n"
-"                           it is in the run, else every client that is not noisy\n"
+"      --senpai-client NAME Cgroup to enroll (repeatable). Does not pin a role.\n"
+"                           Default: client2_noisy if it is in the run, else\n"
+"                           every name containing \"noisy\"\n"
+"      --senpai-victim NAME Cgroup to enroll (repeatable). Does not pin a role.\n"
+"                           Default: client1_steady if it is in the run, else\n"
+"                           every enrolled client that is not noisy\n"
 "      --senpai-min-size N  memory.high floor (bytes / K/M/G; default 100M)\n"
 "      --senpai-max-size N  memory.high ceiling (default: 2G)\n"
-"      --senpai-interval N  Probe interval seconds (default: 6)\n"
-"      --senpai-pressure N  Memory-stall budget in µs (default: 10000)\n"
-"      --senpai-p99-target N  Client1 p99 SLO in µs (default: 3.0)\n"
+"      --senpai-interval N  Accepted for compatibility. Dynamic senpai samples\n"
+"                           every 1s; this flag does not change that.\n"
+"      --senpai-pressure N  Accepted for compatibility; unused by dynamic senpai.\n"
 "      --senpai-low-min N   Client1 memory.low floor (bytes / K/M/G)\n"
 "      --senpai-low-max N   Client1 memory.low ceiling (default: 2G)\n"
 "  -m, --mode MODE          cached | direct | both (default: both)\n"
@@ -2405,8 +2386,6 @@ int main(int argc, char **argv) {
             opt.senpai_interval = atoi(argv[++i]);
         else if (!strcmp(a, "--senpai-pressure") && i + 1 < argc)
             opt.senpai_pressure = atoi(argv[++i]);
-        else if (!strcmp(a, "--senpai-p99-target") && i + 1 < argc)
-            opt.senpai_p99_target = atof(argv[++i]);
         else if (!strcmp(a, "--senpai-low-min") && i + 1 < argc)
             opt.senpai_low_min_size = parse_byte_size(argv[++i]);
         else if (!strcmp(a, "--senpai-low-max") && i + 1 < argc)
